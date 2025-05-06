@@ -150,9 +150,9 @@ def make_pos_neg(
     duration_range=(5, 10),
     sample_rate=16000,
 ):
-    """Generate variable-length positives (speech+noise) & negatives (noise/music)."""
+    """Generate variable-length positives (speech+noise) & negatives (noise/music) with frame-level labels."""
 
-    logger.info(f"Generating {n_pos} positive and {n_neg} negative samples")
+    logger.info(f"Generating {n_pos} positive and {n_neg} negative samples with frame-level labels")
     logger.info(f"Duration range: {duration_range}s, SNR range: {snr_range}dB")
 
     libri = sorted(libri_root.rglob("*.flac"))
@@ -164,12 +164,22 @@ def make_pos_neg(
     )
     assert libri and musan_noise and musan_music, "Missing source audio!"
 
+    # Create directories for audio and frame-level labels
     out_pos.mkdir(parents=True, exist_ok=True)
     out_neg.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Output directories created: {out_pos}, {out_neg}")
+    out_pos_labels = out_pos.parent / "pos_labels"
+    out_neg_labels = out_neg.parent / "neg_labels"
+    out_pos_labels.mkdir(parents=True, exist_ok=True)
+    out_neg_labels.mkdir(parents=True, exist_ok=True)
+    
+    logger.info(f"Output directories created: {out_pos}, {out_neg}, {out_pos_labels}, {out_neg_labels}")
+    
+    # Constants for frame-level calculations
+    hop_length = 160  # Match your spectrogram hop_length
+    win_length = 400  # Match your spectrogram win_length
 
-    # → POSITIVE
-    logger.info("Generating positive samples (speech + noise)...")
+    # → POSITIVE SAMPLES (speech + noise)
+    logger.info("Generating positive samples (speech + noise) with frame-level labels...")
     start_time = time.time()
     for idx, sp_path in enumerate(libri[:n_pos]):
         if idx % 100 == 0:
@@ -177,34 +187,64 @@ def make_pos_neg(
 
         # Random duration between duration_range
         duration = random.uniform(*duration_range)
-        speech, sr = librosa.load(sp_path, sr=sample_rate)
-        speech = librosa.util.fix_length(speech, size=int(duration * sr))
-
-        # Add time stretching, pitch shifting
+        
+        # Load original speech and keep a copy for VAD labels
+        original_speech, sr = librosa.load(sp_path, sr=sample_rate)
+        original_speech = librosa.util.fix_length(original_speech, size=int(duration * sr))
+        
+        # Store a copy for VAD label generation (before any augmentation)
+        clean_speech = original_speech.copy()
+        
+        # Apply augmentation to the speech signal (but not to the reference used for labels)
+        speech = original_speech.copy()
         if random.random() > 0.5:
             speech = librosa.effects.time_stretch(speech, rate=random.uniform(0.9, 1.1))
         if random.random() > 0.5:
             speech = librosa.effects.pitch_shift(
                 speech, sr=sr, n_steps=random.uniform(-2, 2)
             )
-
         speech = librosa.util.fix_length(speech, size=int(duration * sr))
 
+        # Create the noisy mixture
         noise_path = random.choice(musan_noise)
         noise, _ = librosa.load(noise_path, sr=sr, mono=True, duration=duration)
         noise = librosa.util.fix_length(noise, size=len(speech))
         snr_db = random.uniform(*snr_range)
         alpha = 10 ** (-snr_db / 20) * np.std(speech) / (np.std(noise) + 1e-7)
         mix = speech + alpha * noise
+        
+        # Generate frame-level VAD labels from the original clean speech
+        # Number of frames when using hop_length for striding
+        n_frames = 1 + (len(clean_speech) - win_length) // hop_length
+        
+        # Calculate energy of each frame
+        frame_energies = librosa.feature.rms(
+            y=clean_speech, frame_length=win_length, hop_length=hop_length
+        )[0]
+        
+        # Use energy threshold to determine speech/non-speech
+        # Adaptive threshold: a fraction of the maximum energy
+        energy_threshold = 0.05 * np.max(frame_energies)
+        vad_labels = (frame_energies > energy_threshold).astype(np.float32)
+        
+        # Ensure minimum speech segment length (30ms = ~2 frames at 16kHz)
+        # This removes isolated frames marked as speech
+        min_speech_frames = 2
+        for i in range(len(vad_labels) - min_speech_frames + 1):
+            if sum(vad_labels[i:i+min_speech_frames]) > 0 and sum(vad_labels[i:i+min_speech_frames]) < min_speech_frames:
+                vad_labels[i:i+min_speech_frames] = 0
+        
+        # Save audio and frame-level labels
         sf.write(out_pos / f"pos_{idx:06}.wav", mix, sr)
+        np.save(out_pos_labels / f"pos_{idx:06}_labels.npy", vad_labels)
 
     pos_time = time.time() - start_time
     logger.info(
         f"Completed {n_pos} positive samples in {pos_time:.2f}s ({pos_time/n_pos:.3f}s per sample)"
     )
 
-    # → NEGATIVE
-    logger.info("Generating negative samples (noise + music)...")
+    # → NEGATIVE SAMPLES (noise + music)
+    logger.info("Generating negative samples (noise + music) with frame-level labels...")
     start_time = time.time()
     pool = musan_noise + musan_music
     for idx in range(n_neg):
@@ -218,7 +258,13 @@ def make_pos_neg(
         mix = librosa.util.fix_length(
             a, size=int(duration * sr)
         ) + 0.5 * librosa.util.fix_length(b, size=int(duration * sr))
+        
+        # For negative samples, all frames are non-speech (0)
+        n_frames = 1 + (len(mix) - win_length) // hop_length
+        vad_labels = np.zeros(n_frames, dtype=np.float32)
+        
         sf.write(out_neg / f"neg_{idx:06}.wav", mix, sr)
+        np.save(out_neg_labels / f"neg_{idx:06}_labels.npy", vad_labels)
 
     neg_time = time.time() - start_time
     logger.info(
@@ -227,7 +273,7 @@ def make_pos_neg(
 
 
 def write_manifests(prep_dir: pathlib.Path, split=0.9):
-    """Create train/val manifests with stratified splits for class balance."""
+    """Create train/val manifests with paths to audio and frame-level labels."""
     logger.info(f"Creating manifest files with train/val split of {split}")
 
     pos_clips = list(prep_dir.joinpath("pos").glob("*.wav"))
@@ -261,9 +307,13 @@ def write_manifests(prep_dir: pathlib.Path, split=0.9):
         logger.info(f"Writing manifest: {manifest_path}")
         with open(manifest_path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["path", "label"])
+            w.writerow(["path", "label", "frame_labels"])
             for p in sub:
-                w.writerow([p, 1 if "pos_" in p.name else 0])
+                is_speech = 1 if "pos_" in p.name else 0
+                # Path to corresponding frame labels
+                label_dir = "pos_labels" if is_speech else "neg_labels"
+                frame_label_path = prep_dir.parent / label_dir / f"{p.stem}_labels.npy"
+                w.writerow([p, is_speech, frame_label_path])
         logger.info(f"Created manifest {name} with {len(sub)} entries")
 
 
@@ -381,8 +431,8 @@ def prepare_data(args):
 # ───────────────────────────────────────────────────────────────────────
 class CSVMelDataset(Dataset):
     """
-    On‑the‑fly converts WAV → log‑Mel spectrogram.
-      • returns tensor (T, n_mels)
+    On‑the‑fly converts WAV → log‑Mel spectrogram with frame-level VAD labels.
+      • returns tensor (T, n_mels) and frame labels (T)
       • Variable length audio results in variable time frames
       • Optional caching for faster repeated access
     """
@@ -397,10 +447,15 @@ class CSVMelDataset(Dataset):
         sample_rate=16000,
         cache_dir=None,
     ):
-        logger.info(f"Initializing dataset from manifest: {manifest}")
-        self.items = [
-            (r["path"], int(r["label"])) for r in csv.DictReader(open(manifest))
-        ]
+        logger.info(f"Initializing frame-level VAD dataset from manifest: {manifest}")
+        # Now reading in three columns: audio path, clip label, frame label path
+        self.items = []
+        for r in csv.DictReader(open(manifest)):
+            if len(r) >= 3:  # Check if frame_labels column exists
+                self.items.append((r["path"], int(r["label"]), r.get("frame_labels", "")))
+            else:
+                self.items.append((r["path"], int(r["label"]), ""))
+                
         logger.info(f"Loaded {len(self.items)} items from manifest")
 
         logger.info(
@@ -429,16 +484,26 @@ class CSVMelDataset(Dataset):
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                path, lab = self.items[idx]
+                path, clip_label, label_path = self.items[idx]
                 path = pathlib.Path(path)
+                label_path = pathlib.Path(label_path) if label_path else None
 
                 # Try loading from cache first if enabled
                 if self.cache_dir:
                     cache_path = self.cache_dir / f"{path.stem}.pt"
-                    if cache_path.exists():
-                        logger.debug(f"Loading cached mel spectrogram for {path.stem}")
+                    label_cache_path = self.cache_dir / f"{path.stem}_labels.pt"
+                    
+                    if cache_path.exists() and (not label_path or label_cache_path.exists()):
+                        logger.debug(f"Loading cached data for {path.stem}")
                         mel = torch.load(cache_path)
-                        return mel, torch.tensor(lab, dtype=torch.float32)
+                        
+                        # Load frame labels if available, otherwise use clip label for all frames
+                        if label_path and label_cache_path.exists():
+                            frame_labels = torch.load(label_cache_path)
+                        else:
+                            frame_labels = torch.full((mel.shape[0],), clip_label, dtype=torch.float32)
+                            
+                        return mel, frame_labels
 
                 # Load and process audio
                 logger.debug(f"Processing audio file: {path}")
@@ -449,12 +514,27 @@ class CSVMelDataset(Dataset):
                 wav = wav.clamp(-1, 1)
                 mel = self.db(self.mel(wav)).squeeze(0).transpose(0, 1)  # (T,n_mels)
 
+                # Load frame-level labels if available, otherwise use clip label for all frames
+                if label_path and label_path.exists():
+                    frame_labels = torch.from_numpy(np.load(label_path)).float()
+                    # Ensure length matches mel spectrogram frames
+                    if len(frame_labels) > mel.shape[0]:
+                        frame_labels = frame_labels[:mel.shape[0]]
+                    elif len(frame_labels) < mel.shape[0]:
+                        padding = torch.zeros(mel.shape[0] - len(frame_labels), dtype=torch.float32)
+                        frame_labels = torch.cat([frame_labels, padding])
+                else:
+                    # If no frame labels, use clip label for all frames
+                    frame_labels = torch.full((mel.shape[0],), clip_label, dtype=torch.float32)
+
                 # Cache result if enabled
                 if self.cache_dir:
-                    logger.debug(f"Caching mel spectrogram for {path.stem}")
+                    logger.debug(f"Caching data for {path.stem}")
                     torch.save(mel, cache_path)
+                    torch.save(frame_labels, label_cache_path)
 
-                return mel, torch.tensor(lab, dtype=torch.float32)
+                return mel, frame_labels
+                
             except Exception as e:
                 logger.warning(
                     f"Error loading {path} (attempt {attempt+1}/{max_retries}): {e}"
@@ -465,22 +545,34 @@ class CSVMelDataset(Dataset):
                     logger.error(
                         f"Failed to load after {max_retries} attempts, returning zeros"
                     )
-                    return torch.zeros(100, self.mel.n_mels), torch.tensor(0.0)
+                    # Return dummy frame-level data
+                    dummy_frames = 100
+                    return torch.zeros(dummy_frames, self.mel.n_mels), torch.zeros(dummy_frames)
 
 
 def collate_pad(batch, max_frames=3000):
-    """Pad variable‑length Mel sequences on time axis with a maximum length constraint."""
+    """Pad variable-length Mel sequences and their frame labels on time axis."""
     xs, ys = zip(*batch)
     n_mels = xs[0].shape[1]
     longest = max(x.shape[0] for x in xs)
     T = min(longest, max_frames)  # Limit max sequence length
-    logger.debug(
-        f"Collating batch: longest seq={longest}, using T={T}, n_mels={n_mels}"
-    )
-    out = torch.zeros(len(xs), T, n_mels)
-    for i, x in enumerate(xs):
-        out[i, : min(x.shape[0], T)] = x[:T]
-    return out, torch.stack(ys)
+    
+    logger.debug(f"Collating batch: longest seq={longest}, using T={T}, n_mels={n_mels}")
+    
+    # Padded mel spectrograms
+    out_x = torch.zeros(len(xs), T, n_mels)
+    # Padded frame labels
+    out_y = torch.zeros(len(ys), T)
+    # Mask to identify valid (non-padded) frames for each sample
+    mask = torch.zeros(len(xs), T, dtype=torch.bool)
+    
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        frames = min(x.shape[0], T)
+        out_x[i, :frames] = x[:frames]
+        out_y[i, :frames] = y[:frames]
+        mask[i, :frames] = True
+        
+    return out_x, out_y, mask
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -488,7 +580,7 @@ def collate_pad(batch, max_frames=3000):
 # ───────────────────────────────────────────────────────────────────────
 class MelPerformer(nn.Module):
     """
-    Model that performs VAD using Performer attention over mel spectrograms.
+    Model that performs frame-level VAD using Performer attention over mel spectrograms.
     """
 
     def __init__(self, n_mels=64, dim=256, layers=4, heads=4, dim_head=None):
@@ -497,7 +589,7 @@ class MelPerformer(nn.Module):
             dim_head = dim // heads
 
         logger.info(
-            f"Initializing MelPerformer with n_mels={n_mels}, dim={dim}, "
+            f"Initializing frame-level MelPerformer with n_mels={n_mels}, dim={dim}, "
             f"layers={layers}, heads={heads}, dim_head={dim_head}"
         )
         self.proj = nn.Linear(n_mels, dim)
@@ -519,9 +611,9 @@ class MelPerformer(nn.Module):
             ff_dropout=0.1,  # Feedforward dropout
             attn_dropout=0.1,  # Attention dropout
         )
-        self.clf = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1), nn.Flatten(), nn.Linear(dim, 1)
-        )
+        # Change classifier to frame-level prediction (no pooling)
+        self.clf = nn.Linear(dim, 1)
+        
         logger.info(
             f"Model initialized with {sum(p.numel() for p in self.parameters()):,} parameters"
         )
@@ -530,18 +622,18 @@ class MelPerformer(nn.Module):
         logger.debug(f"Forward pass with input shape: {x.shape}")
         x = self.proj(x)  # (B,T,dim)
         x = self.transformer(x)  # (B,T,dim)
-        x = x.transpose(1, 2)  # (B,dim,T)
-        return self.clf(x).squeeze(1)
+        # Apply classifier to each time step
+        return self.clf(x).squeeze(-1)  # (B,T) - one prediction per frame
 
 
 class VADLightning(pl.LightningModule):
     """
-    Lightning wrapper for VAD model with BCE loss & comprehensive metrics logging.
+    Lightning wrapper for frame-level VAD model with BCE loss & comprehensive metrics logging.
     """
 
     def __init__(self, hp):
         super().__init__()
-        logger.info(f"Initializing VADLightning with hyperparameters: {hp}")
+        logger.info(f"Initializing frame-level VADLightning with hyperparameters: {hp}")
         self.save_hyperparameters(hp)
         self.net = MelPerformer(hp.n_mels, hp.dim, hp.n_layers, hp.n_heads)
         self.loss = nn.BCEWithLogitsLoss()
@@ -549,32 +641,38 @@ class VADLightning(pl.LightningModule):
         self.val_f1 = F1Score(task="binary") 
         self.train_auroc = AUROC(task="binary")
         self.val_auroc = AUROC(task="binary")
-        logger.info("VADLightning model initialized")
+        logger.info("Frame-level VADLightning model initialized")
 
     def forward(self, x):
         return self.net(x)
 
     def _step(self, batch, tag):
-        x, y = batch
-        logger.debug(f"{tag} step with batch shapes: x={x.shape}, y={y.shape}")
-        logit = self(x)
-        loss = self.loss(logit, y)
-        preds = torch.sigmoid(logit)
-        acc = ((preds > 0.5) == y.bool()).float().mean()
+        x, y, mask = batch  # Now includes mask for valid frames
+        logger.debug(f"{tag} step with batch shapes: x={x.shape}, y={y.shape}, mask={mask.shape}")
+        
+        logits = self(x)  # (B,T) - per frame logits
+        
+        # Apply loss only on valid (non-padded) frames using the mask
+        valid_logits = logits[mask]
+        valid_targets = y[mask]
+        
+        loss = self.loss(valid_logits, valid_targets)
+        preds = torch.sigmoid(valid_logits)
+        acc = ((preds > 0.5) == valid_targets.bool()).float().mean()
 
         # Log metrics
         self.log(f"{tag}_loss", loss, prog_bar=True, on_epoch=True)
         self.log(f"{tag}_acc", acc, prog_bar=True, on_epoch=True)
 
-        # Use stateful metrics instead of functional API
+        # Use stateful metrics with valid frames only
         if tag == "train":
-            self.train_f1(preds > 0.5, y.int())
-            self.train_auroc(preds, y.int())
+            self.train_f1(preds > 0.5, valid_targets.int())
+            self.train_auroc(preds, valid_targets.int())
             self.log("train_f1", self.train_f1, on_epoch=True)
             self.log("train_auroc", self.train_auroc, on_epoch=True)
         else:  # validation
-            self.val_f1(preds > 0.5, y.int())
-            self.val_auroc(preds, y.int())
+            self.val_f1(preds > 0.5, valid_targets.int())
+            self.val_auroc(preds, valid_targets.int())
             self.log("val_f1", self.val_f1, on_epoch=True)
             self.log("val_auroc", self.val_auroc, on_epoch=True)
 
@@ -628,20 +726,27 @@ class VADDataModule(pl.LightningDataModule):
             f"Initialized VADDataModule with batch_size={batch_size}, num_workers={num_workers}"
         )
 
-    # Replace get_collate_fn with a direct method that can be pickled
     def collate_fn(self, batch):
-        """Pad variable‑length Mel sequences on time axis with a maximum length constraint."""
+        """Pad variable-length Mel sequences and frame labels."""
         xs, ys = zip(*batch)
         n_mels = xs[0].shape[1]
         longest = max(x.shape[0] for x in xs)
         T = min(longest, self.max_frames)  # Limit max sequence length
-        logger.debug(
-            f"Collating batch: longest seq={longest}, using T={T}, n_mels={n_mels}"
-        )
-        out = torch.zeros(len(xs), T, n_mels)
-        for i, x in enumerate(xs):
-            out[i, : min(x.shape[0], T)] = x[:T]
-        return out, torch.stack(ys)
+        
+        # Padded mel spectrograms
+        out_x = torch.zeros(len(xs), T, n_mels)
+        # Padded frame labels
+        out_y = torch.zeros(len(ys), T)
+        # Mask to identify valid (non-padded) frames
+        mask = torch.zeros(len(xs), T, dtype=torch.bool)
+        
+        for i, (x, y) in enumerate(zip(xs, ys)):
+            frames = min(x.shape[0], T)
+            out_x[i, :frames] = x[:frames]
+            out_y[i, :frames] = y[:frames]
+            mask[i, :frames] = True
+            
+        return out_x, out_y, mask
 
     def train_dataloader(self):
         logger.info("Creating training dataloader")
