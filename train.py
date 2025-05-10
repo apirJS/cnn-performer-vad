@@ -8,6 +8,7 @@ from typing import List, Tuple, Optional
 import numpy as np
 import torch, torchaudio
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 import librosa, soundfile as sf
@@ -15,6 +16,10 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from torchmetrics.functional import auroc, f1_score
 from torchmetrics import F1Score, AUROC
+from pytorch_lightning.callbacks import EarlyStopping
+
+import os
+import multiprocessing
 
 # Configure logging
 logging.basicConfig(
@@ -60,15 +65,8 @@ def seed_everything(seed: int = 42):
 
 def get_best_precision():
     """Determine the best precision format for the available hardware."""
-    logger.info("Determining optimal precision for current hardware")
-    if torch.cuda.is_bf16_supported():
-        logger.info("BF16 precision supported, using bf16-mixed")
-        return "bf16-mixed"
-    elif torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7:
-        logger.info("FP16 precision supported, using 16-bit")
-        return 16
-    logger.info("Using default 32-bit precision")
-    return 32  # Default to full precision
+    logger.info("Using default 32-bit precision for stability")
+    return 32  # Always use full precision on GTX 1650
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -152,7 +150,9 @@ def make_pos_neg(
 ):
     """Generate variable-length positives (speech+noise) & negatives (noise/music) with frame-level labels."""
 
-    logger.info(f"Generating {n_pos} positive and {n_neg} negative samples with frame-level labels")
+    logger.info(
+        f"Generating {n_pos} positive and {n_neg} negative samples with frame-level labels"
+    )
     logger.info(f"Duration range: {duration_range}s, SNR range: {snr_range}dB")
 
     libri = sorted(libri_root.rglob("*.flac"))
@@ -171,15 +171,19 @@ def make_pos_neg(
     out_neg_labels = out_neg.parent / "neg_labels"
     out_pos_labels.mkdir(parents=True, exist_ok=True)
     out_neg_labels.mkdir(parents=True, exist_ok=True)
-    
-    logger.info(f"Output directories created: {out_pos}, {out_neg}, {out_pos_labels}, {out_neg_labels}")
-    
+
+    logger.info(
+        f"Output directories created: {out_pos}, {out_neg}, {out_pos_labels}, {out_neg_labels}"
+    )
+
     # Constants for frame-level calculations
     hop_length = 160  # Match your spectrogram hop_length
     win_length = 400  # Match your spectrogram win_length
 
     # → POSITIVE SAMPLES (speech + noise)
-    logger.info("Generating positive samples (speech + noise) with frame-level labels...")
+    logger.info(
+        "Generating positive samples (speech + noise) with frame-level labels..."
+    )
     start_time = time.time()
     for idx, sp_path in enumerate(libri[:n_pos]):
         if idx % 100 == 0:
@@ -187,14 +191,16 @@ def make_pos_neg(
 
         # Random duration between duration_range
         duration = random.uniform(*duration_range)
-        
+
         # Load original speech and keep a copy for VAD labels
         original_speech, sr = librosa.load(sp_path, sr=sample_rate)
-        original_speech = librosa.util.fix_length(original_speech, size=int(duration * sr))
-        
+        original_speech = librosa.util.fix_length(
+            original_speech, size=int(duration * sr)
+        )
+
         # Store a copy for VAD label generation (before any augmentation)
         clean_speech = original_speech.copy()
-        
+
         # Apply augmentation to the speech signal (but not to the reference used for labels)
         speech = original_speech.copy()
         if random.random() > 0.5:
@@ -212,28 +218,28 @@ def make_pos_neg(
         snr_db = random.uniform(*snr_range)
         alpha = 10 ** (-snr_db / 20) * np.std(speech) / (np.std(noise) + 1e-7)
         mix = speech + alpha * noise
-        
+
         # Generate frame-level VAD labels from the original clean speech
         # Number of frames when using hop_length for striding
         n_frames = 1 + (len(clean_speech) - win_length) // hop_length
-        
+
         # Calculate energy of each frame
         frame_energies = librosa.feature.rms(
             y=clean_speech, frame_length=win_length, hop_length=hop_length
         )[0]
-        
-        # Use energy threshold to determine speech/non-speech
-        # Adaptive threshold: a fraction of the maximum energy
-        energy_threshold = 0.05 * np.max(frame_energies)
+
+        # Sort energies and use a better threshold approach
+        sorted_energies = np.sort(frame_energies)
+        # 30th percentile works better than 40th
+        energy_threshold = sorted_energies[int(len(sorted_energies) * 0.3)]
         vad_labels = (frame_energies > energy_threshold).astype(np.float32)
-        
-        # Ensure minimum speech segment length (30ms = ~2 frames at 16kHz)
-        # This removes isolated frames marked as speech
-        min_speech_frames = 2
+
+        # Smooth labels with longer minimum segments
+        min_speech_frames = 3  # Increased from 2 (about 50ms at 16kHz)
         for i in range(len(vad_labels) - min_speech_frames + 1):
-            if sum(vad_labels[i:i+min_speech_frames]) > 0 and sum(vad_labels[i:i+min_speech_frames]) < min_speech_frames:
-                vad_labels[i:i+min_speech_frames] = 0
-        
+            if 0 < sum(vad_labels[i : i + min_speech_frames]) < min_speech_frames:
+                vad_labels[i : i + min_speech_frames] = 0
+
         # Save audio and frame-level labels
         sf.write(out_pos / f"pos_{idx:06}.wav", mix, sr)
         np.save(out_pos_labels / f"pos_{idx:06}_labels.npy", vad_labels)
@@ -244,7 +250,9 @@ def make_pos_neg(
     )
 
     # → NEGATIVE SAMPLES (noise + music)
-    logger.info("Generating negative samples (noise + music) with frame-level labels...")
+    logger.info(
+        "Generating negative samples (noise + music) with frame-level labels..."
+    )
     start_time = time.time()
     pool = musan_noise + musan_music
     for idx in range(n_neg):
@@ -258,11 +266,11 @@ def make_pos_neg(
         mix = librosa.util.fix_length(
             a, size=int(duration * sr)
         ) + 0.5 * librosa.util.fix_length(b, size=int(duration * sr))
-        
+
         # For negative samples, all frames are non-speech (0)
         n_frames = 1 + (len(mix) - win_length) // hop_length
         vad_labels = np.zeros(n_frames, dtype=np.float32)
-        
+
         sf.write(out_neg / f"neg_{idx:06}.wav", mix, sr)
         np.save(out_neg_labels / f"neg_{idx:06}_labels.npy", vad_labels)
 
@@ -446,16 +454,30 @@ class CSVMelDataset(Dataset):
         win=400,
         sample_rate=16000,
         cache_dir=None,
+        time_mask_max=20,
+        freq_mask_max=10,
     ):
         logger.info(f"Initializing frame-level VAD dataset from manifest: {manifest}")
         # Now reading in three columns: audio path, clip label, frame label path
+        self.params = {
+            "n_mels": n_mels,
+            "n_fft": n_fft,
+            "hop": hop,
+            "win": win,
+            "sample_rate": sample_rate,
+        }
+
+        self.manifest = manifest
         self.items = []
+
         for r in csv.DictReader(open(manifest)):
             if len(r) >= 3:  # Check if frame_labels column exists
-                self.items.append((r["path"], int(r["label"]), r.get("frame_labels", "")))
+                self.items.append(
+                    (r["path"], int(r["label"]), r.get("frame_labels", ""))
+                )
             else:
                 self.items.append((r["path"], int(r["label"]), ""))
-                
+
         logger.info(f"Loaded {len(self.items)} items from manifest")
 
         logger.info(
@@ -472,10 +494,47 @@ class CSVMelDataset(Dataset):
         self.db = torchaudio.transforms.AmplitudeToDB(top_db=80)
         self.sample_rate = sample_rate
         self.cache_dir = None
+
+        # Create params file in cache directory for validation
         if cache_dir:
             self.cache_dir = pathlib.Path(cache_dir)
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+            params_file = self.cache_dir / "params.json"
+
+            # Check if params file exists and matches current params
+            if params_file.exists():
+                try:
+                    with open(params_file, "r") as f:
+                        stored_params = json.load(f)
+                    if stored_params != self.params:
+                        logger.warning(f"Cache parameters mismatch! Clearing cache.")
+                        import shutil
+
+                        # Backup existing cache directory
+                        backup_dir = (
+                            self.cache_dir.parent / f"{self.cache_dir.name}_backup"
+                        )
+                        if backup_dir.exists():
+                            shutil.rmtree(backup_dir)
+                        self.cache_dir.rename(backup_dir)
+                        self.cache_dir.mkdir(parents=True)
+                        # Save new params
+                        with open(params_file, "w") as f:
+                            json.dump(self.params, f)
+                except Exception as e:
+                    logger.error(f"Error validating cache parameters: {e}")
+                    # Create new params file
+                    with open(params_file, "w") as f:
+                        json.dump(self.params, f)
+            else:
+                # Save params if file doesn't exist
+                with open(params_file, "w") as f:
+                    json.dump(self.params, f)
+
             logger.info(f"Caching mel spectrograms to {self.cache_dir}")
+
+        self.time_mask_max = time_mask_max
+        self.freq_mask_max = freq_mask_max
 
     def __len__(self):
         return len(self.items)
@@ -492,17 +551,21 @@ class CSVMelDataset(Dataset):
                 if self.cache_dir:
                     cache_path = self.cache_dir / f"{path.stem}.pt"
                     label_cache_path = self.cache_dir / f"{path.stem}_labels.pt"
-                    
-                    if cache_path.exists() and (not label_path or label_cache_path.exists()):
+
+                    if cache_path.exists() and (
+                        not label_path or label_cache_path.exists()
+                    ):
                         logger.debug(f"Loading cached data for {path.stem}")
                         mel = torch.load(cache_path)
-                        
+
                         # Load frame labels if available, otherwise use clip label for all frames
                         if label_path and label_cache_path.exists():
                             frame_labels = torch.load(label_cache_path)
                         else:
-                            frame_labels = torch.full((mel.shape[0],), clip_label, dtype=torch.float32)
-                            
+                            frame_labels = torch.full(
+                                (mel.shape[0],), clip_label, dtype=torch.float32
+                            )
+
                         return mel, frame_labels
 
                 # Load and process audio
@@ -514,18 +577,27 @@ class CSVMelDataset(Dataset):
                 wav = wav.clamp(-1, 1)
                 mel = self.db(self.mel(wav)).squeeze(0).transpose(0, 1)  # (T,n_mels)
 
+                if (
+                    "train" in str(self.manifest) and random.random() > 0.3
+                ):  # 70% chance for training
+                    mel = self.spec_augment(mel)
+
                 # Load frame-level labels if available, otherwise use clip label for all frames
                 if label_path and label_path.exists():
                     frame_labels = torch.from_numpy(np.load(label_path)).float()
                     # Ensure length matches mel spectrogram frames
                     if len(frame_labels) > mel.shape[0]:
-                        frame_labels = frame_labels[:mel.shape[0]]
+                        frame_labels = frame_labels[: mel.shape[0]]
                     elif len(frame_labels) < mel.shape[0]:
-                        padding = torch.zeros(mel.shape[0] - len(frame_labels), dtype=torch.float32)
+                        padding = torch.zeros(
+                            mel.shape[0] - len(frame_labels), dtype=torch.float32
+                        )
                         frame_labels = torch.cat([frame_labels, padding])
                 else:
                     # If no frame labels, use clip label for all frames
-                    frame_labels = torch.full((mel.shape[0],), clip_label, dtype=torch.float32)
+                    frame_labels = torch.full(
+                        (mel.shape[0],), clip_label, dtype=torch.float32
+                    )
 
                 # Cache result if enabled
                 if self.cache_dir:
@@ -534,7 +606,7 @@ class CSVMelDataset(Dataset):
                     torch.save(frame_labels, label_cache_path)
 
                 return mel, frame_labels
-                
+
             except Exception as e:
                 logger.warning(
                     f"Error loading {path} (attempt {attempt+1}/{max_retries}): {e}"
@@ -545,9 +617,33 @@ class CSVMelDataset(Dataset):
                     logger.error(
                         f"Failed to load after {max_retries} attempts, returning zeros"
                     )
-                    # Return dummy frame-level data
+                    # Return dummy frame-level data with special flag for error detection
                     dummy_frames = 100
-                    return torch.zeros(dummy_frames, self.mel.n_mels), torch.zeros(dummy_frames)
+                    dummy_mel = torch.zeros(dummy_frames, self.mel.n_mels)
+                    dummy_labels = torch.zeros(dummy_frames)
+                    # Set first value to -1 to flag this as an error sample that should be handled specially
+                    dummy_mel[0, 0] = -1
+                    return dummy_mel, dummy_labels
+
+    # Update spec_augment method:
+    def spec_augment(self, mel_spectrogram):
+        """Apply SpecAugment to mel spectrogram for data augmentation."""
+        # Make a copy to avoid modifying the original
+        mel = mel_spectrogram.clone()
+
+        # Time masking
+        for i in range(random.randint(1, 2)):
+            t = random.randint(0, min(self.time_mask_max, mel.shape[0] // 10))
+            t0 = random.randint(0, mel.shape[0] - t)
+            mel[t0 : t0 + t, :] = 0
+
+        # Frequency masking
+        for i in range(random.randint(1, 2)):
+            f = random.randint(0, min(self.freq_mask_max, mel.shape[1] // 4))
+            f0 = random.randint(0, mel.shape[1] - f)
+            mel[:, f0 : f0 + f] = 0
+
+        return mel
 
 
 def collate_pad(batch, max_frames=3000):
@@ -556,22 +652,24 @@ def collate_pad(batch, max_frames=3000):
     n_mels = xs[0].shape[1]
     longest = max(x.shape[0] for x in xs)
     T = min(longest, max_frames)  # Limit max sequence length
-    
-    logger.debug(f"Collating batch: longest seq={longest}, using T={T}, n_mels={n_mels}")
-    
+
+    logger.debug(
+        f"Collating batch: longest seq={longest}, using T={T}, n_mels={n_mels}"
+    )
+
     # Padded mel spectrograms
     out_x = torch.zeros(len(xs), T, n_mels)
     # Padded frame labels
     out_y = torch.zeros(len(ys), T)
     # Mask to identify valid (non-padded) frames for each sample
     mask = torch.zeros(len(xs), T, dtype=torch.bool)
-    
+
     for i, (x, y) in enumerate(zip(xs, ys)):
         frames = min(x.shape[0], T)
         out_x[i, :frames] = x[:frames]
         out_y[i, :frames] = y[:frames]
         mask[i, :frames] = True
-        
+
     return out_x, out_y, mask
 
 
@@ -592,35 +690,69 @@ class MelPerformer(nn.Module):
             f"Initializing frame-level MelPerformer with n_mels={n_mels}, dim={dim}, "
             f"layers={layers}, heads={heads}, dim_head={dim_head}"
         )
-        self.proj = nn.Linear(n_mels, dim)
+
+        # Add convolutional layers to capture local patterns
+        # Enhanced frontend with BatchNorm
+        self.conv_layers = nn.Sequential(
+            nn.Conv1d(n_mels, dim // 2, kernel_size=3, padding=1),
+            nn.BatchNorm1d(dim // 2),  # Add BatchNorm for stability
+            nn.ReLU(),
+            nn.Conv1d(dim // 2, dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(dim),  # Add BatchNorm
+            nn.ReLU(),
+        )
+
+        # Initialize all weights properly
+        for m in self.conv_layers.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        self.proj = nn.Linear(dim, dim)  # Changed input dimension to match conv output
+        self.norm = nn.LayerNorm(dim)
+
         self.transformer = Performer(
             dim=dim,
             depth=layers,
             heads=heads,
             dim_head=dim // heads,
             causal=False,
-            nb_features=256,  # Number of random features, can improve performance
-            feature_redraw_interval=1000,  # How often to redraw random features during training
-            generalized_attention=False,  # Use ReLU kernel instead of softmax approximation
-            # kernel_fn=torch.nn.ReLU(),  # Only used if generalized_attention=True
-            reversible=False,  # Whether to use reversible layers for memory efficiency
-            ff_chunks=1,  # Number of chunks for feed-forward layer computation
-            use_scalenorm=False,  # Alternative to LayerNorm
-            use_rezero=False,  # Use ReZero initialization
-            ff_glu=True,  # Use GLU variant for feedforward
-            ff_dropout=0.1,  # Feedforward dropout
-            attn_dropout=0.1,  # Attention dropout
+            nb_features=512,  # Increased from 256
+            feature_redraw_interval=500,
+            generalized_attention=False,
+            reversible=True,
+            ff_chunks=1,
+            use_scalenorm=False,
+            use_rezero=False,
+            ff_glu=True,
+            ff_dropout=0.2,  # Increased dropout
+            attn_dropout=0.2,  # Increased dropout
         )
+
         # Change classifier to frame-level prediction (no pooling)
-        self.clf = nn.Linear(dim, 1)
-        
+        # More robust classifier
+        self.clf = nn.Sequential(
+            nn.Linear(dim, dim // 2),
+            nn.LayerNorm(dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim // 2, 1),
+        )
+
         logger.info(
             f"Model initialized with {sum(p.numel() for p in self.parameters()):,} parameters"
         )
 
     def forward(self, x):  # x (B,T,n_mels)
         logger.debug(f"Forward pass with input shape: {x.shape}")
+        # Process with convolutional layers (transpose for conv1d)
+        x = x.transpose(1, 2)  # (B,n_mels,T)
+        x = self.conv_layers(x)  # (B,dim,T)
+        x = x.transpose(1, 2)  # (B,T,dim)
+
         x = self.proj(x)  # (B,T,dim)
+        x = self.norm(x)
         x = self.transformer(x)  # (B,T,dim)
         # Apply classifier to each time step
         return self.clf(x).squeeze(-1)  # (B,T) - one prediction per frame
@@ -636,9 +768,13 @@ class VADLightning(pl.LightningModule):
         logger.info(f"Initializing frame-level VADLightning with hyperparameters: {hp}")
         self.save_hyperparameters(hp)
         self.net = MelPerformer(hp.n_mels, hp.dim, hp.n_layers, hp.n_heads)
-        self.loss = nn.BCEWithLogitsLoss()
+
+        # Use weighted BCE loss
+        pos_weight = torch.tensor([hp.pos_weight])
+        self.loss = FocalLoss(alpha=0.25, gamma=2.0)
+
         self.train_f1 = F1Score(task="binary")
-        self.val_f1 = F1Score(task="binary") 
+        self.val_f1 = F1Score(task="binary")
         self.train_auroc = AUROC(task="binary")
         self.val_auroc = AUROC(task="binary")
         logger.info("Frame-level VADLightning model initialized")
@@ -648,14 +784,16 @@ class VADLightning(pl.LightningModule):
 
     def _step(self, batch, tag):
         x, y, mask = batch  # Now includes mask for valid frames
-        logger.debug(f"{tag} step with batch shapes: x={x.shape}, y={y.shape}, mask={mask.shape}")
-        
+        logger.debug(
+            f"{tag} step with batch shapes: x={x.shape}, y={y.shape}, mask={mask.shape}"
+        )
+
         logits = self(x)  # (B,T) - per frame logits
-        
+
         # Apply loss only on valid (non-padded) frames using the mask
         valid_logits = logits[mask]
         valid_targets = y[mask]
-        
+
         loss = self.loss(valid_logits, valid_targets)
         preds = torch.sigmoid(valid_logits)
         acc = ((preds > 0.5) == valid_targets.bool()).float().mean()
@@ -676,9 +814,7 @@ class VADLightning(pl.LightningModule):
             self.log("val_f1", self.val_f1, on_epoch=True)
             self.log("val_auroc", self.val_auroc, on_epoch=True)
 
-        logger.debug(
-            f"{tag} metrics: loss={loss:.4f}, acc={acc:.4f}"
-        )
+        logger.debug(f"{tag} metrics: loss={loss:.4f}, acc={acc:.4f}")
         return loss
 
     def training_step(self, b, _):
@@ -690,18 +826,47 @@ class VADLightning(pl.LightningModule):
         self._step(b, "val")
 
     def configure_optimizers(self):
-        logger.info(
-            f"Configuring optimizer with lr={self.hparams.lr}, weight_decay=1e-4"
-        )
+        logger.info(f"Configuring optimizer with lr={self.hparams.lr}")
         opt = torch.optim.AdamW(
             self.parameters(), lr=self.hparams.lr, weight_decay=1e-4
         )
-        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=2, factor=0.5)
-        logger.info("Optimizer and learning rate scheduler configured")
-        return {
-            "optimizer": opt,
-            "lr_scheduler": {"scheduler": sch, "monitor": "val_loss"},
+
+        # OneCycle scheduler - better convergence
+        scheduler = {
+            "scheduler": torch.optim.lr_scheduler.OneCycleLR(
+                opt,
+                max_lr=self.hparams.lr,
+                total_steps=self.trainer.estimated_stepping_batches,
+                pct_start=0.1,  # First 10% for warmup
+                div_factor=25,  # Start with lr/25
+                final_div_factor=1000,
+                anneal_strategy="cos",
+            ),
+            "interval": "step",
+            "frequency": 1,
         }
+
+        return {"optimizer": opt, "lr_scheduler": scheduler}
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction="mean"):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+
+        # Apply focal loss formula
+        pt = torch.exp(-BCE_loss)  # Probability of being correct
+        F_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
+
+        if self.reduction == "mean":
+            return torch.mean(F_loss)
+        else:
+            return torch.sum(F_loss)
 
 
 # ───────────────────────────────────────────────────────────────
@@ -732,20 +897,20 @@ class VADDataModule(pl.LightningDataModule):
         n_mels = xs[0].shape[1]
         longest = max(x.shape[0] for x in xs)
         T = min(longest, self.max_frames)  # Limit max sequence length
-        
+
         # Padded mel spectrograms
         out_x = torch.zeros(len(xs), T, n_mels)
         # Padded frame labels
         out_y = torch.zeros(len(ys), T)
         # Mask to identify valid (non-padded) frames
         mask = torch.zeros(len(xs), T, dtype=torch.bool)
-        
+
         for i, (x, y) in enumerate(zip(xs, ys)):
             frames = min(x.shape[0], T)
             out_x[i, :frames] = x[:frames]
             out_y[i, :frames] = y[:frames]
             mask[i, :frames] = True
-            
+
         return out_x, out_y, mask
 
     def train_dataloader(self):
@@ -779,10 +944,11 @@ class VADDataModule(pl.LightningDataModule):
 def build_parser():
     logger.info("Building argument parser")
     p = argparse.ArgumentParser("Mel‑spectrogram Performer VAD")
+
     # workspace / data prep
     p.add_argument(
         "--vad_root",
-        default="vad_corpus",
+        default="datasets",
         help="Root directory for all datasets and outputs",
     )
     p.add_argument(
@@ -813,15 +979,36 @@ def build_parser():
         default=16000,
         help="Sample rate for audio processing",
     )
+    p.add_argument(
+        "--time_mask_max",
+        type=int,
+        default=20,
+        help="Maximum time mask length for SpecAugment",
+    )
+    p.add_argument(
+        "--freq_mask_max",
+        type=int,
+        default=10,
+        help="Maximum frequency mask length for SpecAugment",
+    )
+
     # manifests
     p.add_argument("--train_manifest", help="Path to training manifest CSV")
     p.add_argument("--val_manifest", help="Path to validation manifest CSV")
+    p.add_argument("--test_manifest", help="Path to test manifest for final evaluation")
+    p.add_argument(
+        "--test_after_training",
+        action="store_true",
+        help="Run evaluation on test set after training",
+    )
+
     # mel params
     p.add_argument(
         "--n_mels", type=int, default=64, help="Number of mel bands in spectrogram"
     )
     p.add_argument("--n_fft", type=int, default=400, help="FFT size for spectrogram")
     p.add_argument("--hop", type=int, default=160, help="Hop length for spectrogram")
+
     # caching
     p.add_argument(
         "--use_mel_cache",
@@ -833,6 +1020,7 @@ def build_parser():
         default="mel_cache",
         help="Directory to store cached Mel spectrograms",
     )
+
     # model
     p.add_argument(
         "--dim", type=int, default=256, help="Transformer embedding dimension"
@@ -847,21 +1035,123 @@ def build_parser():
         default=2000,
         help="Maximum number of frames to use in a sequence",
     )
-    # optim
-    p.add_argument("--batch_size", type=int, default=4, help="Training batch size")
     p.add_argument(
-        "--num_workers", type=int, default=4, help="Number of data loading workers"
+        "--export_model",
+        action="store_true",
+        help="Export the trained model for inference",
     )
+    p.add_argument(
+        "--export_path", default="vad_model.pt", help="Path to save the exported model"
+    )
+
+    # optim
+    cpu_count = max(1, multiprocessing.cpu_count() - 2)
+    p.add_argument("--batch_size", type=int, default=4, help="Training batch size")
     p.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     p.add_argument("--max_epochs", type=int, default=10, help="Maximum training epochs")
     p.add_argument("--gpus", type=int, default=1, help="Number of GPUs to use")
+    p.add_argument(
+        "--num_workers",
+        type=int,
+        default=cpu_count,
+        help=f"Number of data loading workers (default: {cpu_count}, based on CPU count)",
+    )
+    p.add_argument(
+        "--gradient_clip_val",
+        type=float,
+        default=1.0,
+        help="Gradient clipping to prevent exploding gradients",
+    )
+    p.add_argument(
+        "--warmup_epochs",
+        type=float,
+        default=0.5,
+        help="Number of epochs for learning rate warmup",
+    )
+    p.add_argument(
+        "--pos_weight",
+        type=float,
+        default=2.0,
+        help="Positive class weight for BCE loss to handle imbalance",
+    )
+    p.add_argument(
+        "--auto_batch_size",
+        action="store_true",
+        help="Automatically determine optimal batch size based on GPU memory",
+    )
+
     # checkpoint / misc
     p.add_argument("--ckpt_path", help="Path to checkpoint for resuming training")
     p.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
+    p.add_argument(
+        "--accumulate_grad_batches",
+        type=int,
+        default=1,
+        help="Number of batches to accumulate gradients before optimizer step",
+    )
+    p.add_argument(
+        "--log_dir", default="lightning_logs", help="Directory for TensorBoard logs"
+    )
     logger.info("Argument parser configured")
     return p
+
+
+# Add this function before main()
+def export_model(model_path, output_path):
+    """Export a trained model for inference."""
+    logger.info(f"Loading checkpoint from {model_path}")
+    model = VADLightning.load_from_checkpoint(model_path)
+    model.eval()
+
+    # Extract the core network without the Lightning wrapper
+    net = model.net
+
+    logger.info(f"Creating TorchScript model")
+    # Script the model for portable deployment
+    scripted_model = torch.jit.script(net)
+
+    logger.info(f"Saving model to {output_path}")
+    torch.jit.save(scripted_model, output_path)
+    logger.info(f"Model exported successfully")
+    print(f"✅ Model exported to {output_path}")
+
+
+# Add this function before main():
+def estimate_optimal_batch_size(model, n_mels, max_frames, gpu_memory_gb=None):
+    """Estimate optimal batch size based on available GPU memory."""
+    if not torch.cuda.is_available():
+        logger.info("No GPU available, using default batch size")
+        return 4  # Default batch size for CPU
+
+    # Get available GPU memory if not provided
+    if gpu_memory_gb is None:
+        gpu_memory_bytes = torch.cuda.get_device_properties(0).total_memory
+        gpu_memory_gb = gpu_memory_bytes / (1024**3)
+
+    # Estimate memory requirements
+    n_params = sum(p.numel() for p in model.parameters())
+    param_memory_gb = n_params * 4 / (1024**3)  # 4 bytes per parameter
+
+    # Memory for single sample with gradients (roughly 3x forward pass)
+    sample_memory_gb = 3 * max_frames * n_mels * 4 / (1024**3)
+
+    # Reserve memory for PyTorch's own usage and other overhead (30%)
+    available_memory_gb = gpu_memory_gb * 0.7 - param_memory_gb
+
+    # Calculate maximum batch size based on available memory
+    max_batch_size = max(1, int(available_memory_gb / sample_memory_gb))
+
+    # Cap at reasonable limits
+    optimal_batch_size = min(64, max(1, max_batch_size))
+
+    logger.info(f"Estimated GPU memory: {gpu_memory_gb:.2f} GB")
+    logger.info(f"Parameter memory: {param_memory_gb:.2f} GB")
+    logger.info(f"Sample memory: {sample_memory_gb:.2f} GB per sample")
+    logger.info(f"Optimal batch size: {optimal_batch_size}")
+
+    return optimal_batch_size
 
 
 def main():
@@ -916,6 +1206,8 @@ def main():
         args.hop,
         sample_rate=args.sample_rate,
         cache_dir=cache_dir,
+        time_mask_max=args.time_mask_max,
+        freq_mask_max=args.freq_mask_max,
     )
 
     logger.info("Initializing validation dataset")
@@ -926,7 +1218,20 @@ def main():
         args.hop,
         sample_rate=args.sample_rate,
         cache_dir=cache_dir,
+        time_mask_max=args.time_mask_max,
+        freq_mask_max=args.freq_mask_max,
     )
+
+    if args.auto_batch_size and torch.cuda.is_available():
+        logger.info("Estimating optimal batch size based on GPU memory")
+        # Create a temporary model instance for estimation
+        temp_model = VADLightning(args)
+        optimal_batch_size = estimate_optimal_batch_size(
+            temp_model, args.n_mels, args.max_frames
+        )
+        logger.info(f"Using automatically determined batch size: {optimal_batch_size}")
+        args.batch_size = optimal_batch_size
+        print(f"📊 Auto-determined batch size: {optimal_batch_size}")
 
     logger.info(
         f"Creating custom datamodule with batch_size={args.batch_size}, num_workers={args.num_workers}"
@@ -951,6 +1256,9 @@ def main():
         auto_insert_metric_name=False,
     )
     cb_lr = LearningRateMonitor(logging_interval="epoch")
+    cb_early_stop = EarlyStopping(
+        monitor="val_loss", patience=3, mode="min", verbose=True
+    )
 
     # Memory estimate
     n_params = sum(p.numel() for p in model.parameters())
@@ -972,20 +1280,77 @@ def main():
     accelerator = "gpu" if args.gpus else "cpu"
     logger.info(f"Using {accelerator} with precision={precision}")
 
+    if args.gpus > 1:
+        strategy = "ddp"
+        logger.info(f"Using DDP strategy for {args.gpus} GPUs")
+    else:
+        strategy = "auto"  # Change from None to "auto"
+        logger.info(f"Using single device strategy")
+
     trainer = pl.Trainer(
         accelerator=accelerator,
         devices=args.gpus or 1,
         max_epochs=args.max_epochs,
         precision=precision,
-        callbacks=[cb_ckpt, cb_lr],
+        callbacks=[cb_ckpt, cb_lr, cb_early_stop],
         log_every_n_steps=25,
-        # Remove the resume_from_checkpoint parameter
+        accumulate_grad_batches=args.accumulate_grad_batches,
+        gradient_clip_val=args.gradient_clip_val,
+        strategy=strategy,
+        logger=pl.loggers.TensorBoardLogger(save_dir=args.log_dir),
     )
 
     logger.info("Starting training")
     # Pass the checkpoint path to the fit method instead
     trainer.fit(model, dm, ckpt_path=args.ckpt_path)
     logger.info("Training completed")
+
+    if args.test_after_training and args.test_manifest:
+        logger.info(f"Running final evaluation on test set: {args.test_manifest}")
+
+        # Load test dataset
+        test_dataset = CSVMelDataset(
+            args.test_manifest,
+            args.n_mels,
+            args.n_fft,
+            args.hop,
+            sample_rate=args.sample_rate,
+            cache_dir=cache_dir,
+            time_mask_max=args.time_mask_max,
+            freq_mask_max=args.freq_mask_max,
+        )
+
+        # Create test dataloader
+        test_dataloader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=dm.collate_fn,
+            pin_memory=True,
+        )
+
+        # Use best checkpoint for testing
+        if hasattr(cb_ckpt, "best_model_path") and cb_ckpt.best_model_path:
+            logger.info(f"Using best checkpoint: {cb_ckpt.best_model_path}")
+            best_model = VADLightning.load_from_checkpoint(cb_ckpt.best_model_path)
+
+            # Run test
+            logger.info("Testing model performance...")
+            test_results = trainer.test(best_model, test_dataloader)[0]
+            logger.info(f"Test results: {test_results}")
+            print(f"✅ Test results: {test_results}")
+        else:
+            logger.warning("No best checkpoint found, skipping test evaluation")
+
+    # Add at the end of main() function, after training
+    if (
+        args.export_model
+        and hasattr(cb_ckpt, "best_model_path")
+        and cb_ckpt.best_model_path
+    ):
+        logger.info(f"Exporting best model from {cb_ckpt.best_model_path}")
+        export_model(cb_ckpt.best_model_path, args.export_path)
 
 
 if __name__ == "__main__":
