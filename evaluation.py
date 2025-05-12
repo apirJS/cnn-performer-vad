@@ -59,7 +59,7 @@ MUSAN_URL = "https://www.openslr.org/resources/17/musan.tar.gz"
 def get_dataset_paths(root):
     """Returns consistent paths to shared datasets and test-specific directories."""
     root_path = pathlib.Path(root).expanduser()
-    
+
     return {
         "root": root_path,
         "librispeech": root_path / "LibriSpeech",
@@ -68,10 +68,11 @@ def get_dataset_paths(root):
         "test_manifest": root_path / "manifest_test.csv",
     }
 
+
 def prepare_test_data(args):
     """Download, extract, and prepare audio data for VAD evaluation."""
     logger.info("Starting test data preparation process")
-    
+
     paths = get_dataset_paths(args.test_root)
     root = paths["root"]
     root.mkdir(parents=True, exist_ok=True)
@@ -143,16 +144,20 @@ def prepare_test_data(args):
         libri_root = root / "LibriSpeech" / "test-clean"
         musan_root = root / "musan"
         prep = root / "prepared"
-        prep_pos, prep_neg = prep / "pos", prep / "neg"
+
+        # Updated paths for test split
+        test_pos, test_neg = prep / "test" / "pos", prep / "test" / "neg"
+
         make_pos_neg(
             libri_root,
             musan_root,
-            prep_pos,
-            prep_neg,
+            test_pos,
+            test_neg,
             args.n_test,  # Equal number of positives and negatives
             args.n_test,
             duration_range=args.duration_range,
             sample_rate=args.sample_rate,
+            split_name="test",  # Add split name
         )
         state["samples_generated"] = True
         with open(state_file, "w") as f:
@@ -164,7 +169,7 @@ def prepare_test_data(args):
     # Create test manifest if not done
     if not state.get("manifest_created", False):
         logger.info("Creating test manifest")
-        create_test_manifest(root / "prepared", root / "manifest_test.csv")
+        create_test_manifest(root / "prepared" / "test", root / "manifest_test.csv")
         state["manifest_created"] = True
         with open(state_file, "w") as f:
             json.dump(state, f)
@@ -199,8 +204,8 @@ def create_test_manifest(prep_dir: pathlib.Path, manifest_path: pathlib.Path):
         w.writerow(["path", "label", "frame_labels"])
         for p in all_clips:
             is_speech = 1 if "pos_" in p.name else 0
-            # Path to corresponding frame labels
-            label_dir = "pos_labels" if is_speech else "neg_labels"
+            # Path to corresponding frame labels with updated directory names
+            label_dir = "test_pos_labels" if is_speech else "test_neg_labels"
             frame_label_path = prep_dir.parent / label_dir / f"{p.stem}_labels.npy"
             w.writerow([p, is_speech, frame_label_path])
 
@@ -364,6 +369,12 @@ def plot_metrics(frame_preds, frame_labels, clip_preds, clip_labels, output_dir)
 
     binary_preds = (frame_preds >= optimal_threshold).astype(int)
     cm = confusion_matrix(frame_labels, binary_preds)
+    
+    # Calculate correct F1 score from confusion matrix elements
+    tn, fp, fn, tp = cm.ravel()
+    precision_from_cm = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall_from_cm = tp / (tp + fn) if (tp + fn) > 0 else 0
+    frame_f1 = 2 * precision_from_cm * recall_from_cm / (precision_from_cm + recall_from_cm) if (precision_from_cm + recall_from_cm) > 0 else 0
 
     plt.figure(figsize=(10, 8))
     sns.heatmap(
@@ -559,8 +570,6 @@ def plot_metrics(frame_preds, frame_labels, clip_preds, clip_labels, output_dir)
         "Clip F1",
     ]
 
-    # Calculate F1 scores at optimal thresholds
-    frame_f1 = f1_score(frame_labels, binary_preds)
     clip_f1 = f1_score(clip_labels, clip_binary_preds)
 
     metrics_values = [roc_auc, pr_auc, frame_f1, clip_roc_auc, clip_pr_auc, clip_f1]
@@ -700,10 +709,12 @@ def main():
 
     args = parser.parse_args()
     logger.info(f"Parsed arguments: {args}")
-    
+
     # Windows compatibility: Disable multiprocessing on Windows
     if sys.platform == "win32" and args.num_workers > 0:
-        logger.warning("Running on Windows - setting num_workers=0 to avoid multiprocessing issues")
+        logger.warning(
+            "Running on Windows - setting num_workers=0 to avoid multiprocessing issues"
+        )
         args.num_workers = 0
         print("⚠️ Windows detected: Setting num_workers=0 for compatibility")
 

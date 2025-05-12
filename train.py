@@ -147,11 +147,12 @@ def make_pos_neg(
     snr_range=(0, 15),
     duration_range=(5, 10),
     sample_rate=16000,
+    split_name="train"
 ):
     """Generate variable-length positives (speech+noise) & negatives (noise/music) with frame-level labels."""
 
     logger.info(
-        f"Generating {n_pos} positive and {n_neg} negative samples with frame-level labels"
+        f"Generating {n_pos} positive and {n_neg} negative samples for {split_name} split"
     )
     logger.info(f"Duration range: {duration_range}s, SNR range: {snr_range}dB")
 
@@ -167,8 +168,8 @@ def make_pos_neg(
     # Create directories for audio and frame-level labels
     out_pos.mkdir(parents=True, exist_ok=True)
     out_neg.mkdir(parents=True, exist_ok=True)
-    out_pos_labels = out_pos.parent / "pos_labels"
-    out_neg_labels = out_neg.parent / "neg_labels"
+    out_pos_labels = out_pos.parent / f"{split_name}_pos_labels"  # Updated path
+    out_neg_labels = out_neg.parent / f"{split_name}_neg_labels"  # Updated path
     out_pos_labels.mkdir(parents=True, exist_ok=True)
     out_neg_labels.mkdir(parents=True, exist_ok=True)
 
@@ -324,6 +325,34 @@ def write_manifests(prep_dir: pathlib.Path, split=0.9):
                 w.writerow([p, is_speech, frame_label_path])
         logger.info(f"Created manifest {name} with {len(sub)} entries")
 
+def create_manifest(prep_dir: pathlib.Path, manifest_path: pathlib.Path, split_name: str):
+    """Create manifest with paths to audio and frame-level labels for specific split."""
+    logger.info(f"Creating {split_name} manifest file")
+
+    pos_clips = list(prep_dir.joinpath("pos").glob("*.wav"))
+    neg_clips = list(prep_dir.joinpath("neg").glob("*.wav"))
+
+    logger.info(
+        f"Found {len(pos_clips)} positive and {len(neg_clips)} negative samples for {split_name}"
+    )
+
+    # Combine and shuffle samples
+    all_clips = pos_clips + neg_clips
+    random.shuffle(all_clips)
+
+    logger.info(f"Writing manifest: {manifest_path}")
+    with open(manifest_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["path", "label", "frame_labels"])
+        for p in all_clips:
+            is_speech = 1 if "pos_" in p.name else 0
+            # Path to corresponding frame labels
+            label_dir = f"{split_name}_pos_labels" if is_speech else f"{split_name}_neg_labels"
+            frame_label_path = prep_dir.parent / label_dir / f"{p.stem}_labels.npy"
+            w.writerow([p, is_speech, frame_label_path])
+
+    logger.info(f"Created {split_name} manifest with {len(all_clips)} entries")
+    return manifest_path
 
 def prepare_data(args):
     """Download, extract, and prepare audio data for VAD training with state tracking."""
@@ -401,17 +430,43 @@ def prepare_data(args):
         libri_root = root / "LibriSpeech" / "train-clean-100"
         musan_root = root / "musan"
         prep = root / "prepared"
-        prep_pos, prep_neg = prep / "pos", prep / "neg"
+        
+        # Create train/val splits - updated paths
+        train_pos, train_neg = prep / "train" / "pos", prep / "train" / "neg"
+        val_pos, val_neg = prep / "val" / "pos", prep / "val" / "neg"
+        
+        # Calculate split sizes (90% train, 10% val)
+        train_pos_count = int(args.n_pos * 0.9)
+        train_neg_count = int(args.n_neg * 0.9)
+        val_pos_count = args.n_pos - train_pos_count
+        val_neg_count = args.n_neg - train_neg_count
+        
+        logger.info(f"Creating training set with {train_pos_count} positive and {train_neg_count} negative samples")
         make_pos_neg(
             libri_root,
             musan_root,
-            prep_pos,
-            prep_neg,
-            args.n_pos,
-            args.n_neg,
+            train_pos,
+            train_neg,
+            train_pos_count,
+            train_neg_count,
             duration_range=args.duration_range,
             sample_rate=args.sample_rate,
+            split_name="train",  # Add split name
         )
+        
+        logger.info(f"Creating validation set with {val_pos_count} positive and {val_neg_count} negative samples")
+        make_pos_neg(
+            libri_root,
+            musan_root,
+            val_pos,
+            val_neg,
+            val_pos_count,
+            val_neg_count,
+            duration_range=args.duration_range,
+            sample_rate=args.sample_rate,
+            split_name="val",  # Add split name
+        )
+        
         state["samples_generated"] = True
         with open(state_file, "w") as f:
             json.dump(state, f)
@@ -419,10 +474,11 @@ def prepare_data(args):
     else:
         logger.info("Samples already generated, skipping")
 
-    # Create manifests if not done
+    # Create manifests directly rather than using write_manifests
     if not state.get("manifests_created", False):
         logger.info("Creating train/val manifests")
-        write_manifests(root / "prepared")
+        create_manifest(root / "prepared" / "train", root / "manifest_train.csv", "train")
+        create_manifest(root / "prepared" / "val", root / "manifest_val.csv", "val")
         state["manifests_created"] = True
         with open(state_file, "w") as f:
             json.dump(state, f)
