@@ -1,0 +1,326 @@
+===========================================================================
+VOICE ACTIVITY DETECTION (VAD) TOOLKIT - USAGE GUIDE
+===========================================================================
+
+This document provides comprehensive instructions for using the VAD toolkit's
+command-line interface (cli.py).
+
+TABLE OF CONTENTS:
+-----------------
+1. Overview
+2. General Usage
+3. Data Preparation
+4. Model Training
+5. Model Evaluation
+6. Inference
+7. Common Workflows
+8. Troubleshooting
+
+===========================================================================
+1. OVERVIEW
+===========================================================================
+
+The VAD toolkit provides a unified command-line interface for:
+- Preparing datasets for training and evaluation
+- Training VAD models on mel-spectrograms
+- Evaluating model performance
+- Running inference on audio files
+
+The system is built to detect speech vs. non-speech at frame level using
+a Performer-based neural network architecture.
+
+===========================================================================
+2. GENERAL USAGE
+===========================================================================
+
+The CLI follows this general pattern:
+
+    python cli.py COMMAND [options]
+
+Available commands:
+    prepare   - Download and prepare datasets
+    train     - Train a VAD model
+    evaluate  - Evaluate a trained model
+    inference - Run inference on audio files
+
+To see help for any command:
+
+    python cli.py COMMAND --help
+
+===========================================================================
+3. DATA PREPARATION
+===========================================================================
+
+The prepare command downloads LibriSpeech and MUSAN datasets and creates
+positive (speech) and negative (non-speech) examples.
+
+Basic usage:
+    python cli.py prepare --root PATH_TO_DATA_DIR
+
+Options:
+    --root ROOT             Root directory for datasets (required)
+    --splits SPLITS         Dataset splits to prepare [train, val, test]
+                            Default: train val
+    --n_pos N               Number of positive samples per split (default: 2000)
+    --n_neg N               Number of negative samples per split (default: 2000)
+    --duration_range MIN MAX  Min and max audio duration in seconds
+                            Default: 5 10
+    --sample_rate RATE      Audio sample rate (default: 16000)
+    --force                 Force rebuild datasets even if they exist
+    --seed SEED             Random seed (default: 42)
+    --use_full_dataset      Use all LibriSpeech files instead of sample count
+                            (affects training set only)
+
+Examples:
+    # Prepare training and validation data with defaults
+    python cli.py prepare --root datasets
+    
+    # Prepare only test data with more samples
+    python cli.py prepare --root datasets --splits test --n_pos 1000 --n_neg 1000
+    
+    # Prepare all splits with shorter audio clips
+    python cli.py prepare --root datasets --splits train val test --duration_range 2 8
+    
+    # Force rebuild all datasets
+    python cli.py prepare --root datasets --force
+
+===========================================================================
+4. MODEL TRAINING
+===========================================================================
+
+The train command trains a VAD model using PyTorch Lightning.
+
+Basic usage:
+    python cli.py train --vad_root PATH_TO_DATA_DIR
+
+Required Arguments:
+    --vad_root DIR          Root directory for data (same as --root in prepare)
+    --train_manifest PATH   Path to training manifest
+    --val_manifest PATH     Path to validation manifest
+
+Model Architecture:
+    --n_mels N              Number of mel bands (default: 80)
+    --n_fft N               FFT size (default: 512)
+    --hop N                 Hop length (default: 160)
+    --sample_rate RATE      Audio sample rate (default: 16000)
+    --dim N                 Transformer dimension (default: 384)
+    --n_layers N            Number of transformer layers (default: 4)
+    --n_heads N             Number of attention heads (default: 6)
+    --max_frames N          Maximum frames per sequence (default: 2000)
+
+Training Parameters:
+    --batch_size N          Batch size (default: 4)
+    --lr FLOAT              Learning rate (default: 2e-4)
+    --max_epochs N          Maximum training epochs (default: 20)
+    --gpus N                Number of GPUs to use (default: 1)
+    --num_workers N         Number of data loading workers
+    --gradient_clip_val VAL Gradient clipping value (default: 1.0)
+    --warmup_epochs FLOAT   Epochs for lr warmup (default: 0.5)
+    --pos_weight FLOAT      Weight for positive class (default: 2.0)
+    --auto_batch_size       Automatically determine optimal batch size
+    --accumulate_grad_batches N  Gradient accumulation steps (default: 1)
+
+Data Augmentation:
+    --time_mask_max N       Maximum time mask length (default: 20)
+    --freq_mask_max N       Maximum frequency mask length (default: 10)
+
+Caching Options:
+    --use_mel_cache         Cache mel spectrograms to disk
+    --mel_cache_dir DIR     Directory for cached mels (default: mel_cache)
+
+Other Options:
+    --ckpt_path PATH        Resume training from checkpoint
+    --seed SEED             Random seed (default: 42)
+    --log_dir DIR           Directory for logs (default: lightning_logs)
+    --test_after_training   Run evaluation on test set after training
+    --test_manifest PATH    Path to test manifest for evaluation
+    --export_model          Export model after training
+    --export_path PATH      Path for exported model (default: vad_model.pt)
+
+Examples:
+    # Basic training using data from prepare command
+    python cli.py train --vad_root datasets \
+        --train_manifest datasets/manifest_train.csv \
+        --val_manifest datasets/manifest_val.csv
+    
+    # Training with mel caching and model export
+    python cli.py train --vad_root datasets \
+        --train_manifest datasets/manifest_train.csv \
+        --val_manifest datasets/manifest_val.csv \
+        --use_mel_cache --export_model
+    
+    # Advanced training configuration
+    python cli.py train --vad_root datasets \
+        --train_manifest datasets/manifest_train.csv \
+        --val_manifest datasets/manifest_val.csv \
+        --batch_size 8 --max_epochs 30 --lr 1e-4 \
+        --n_layers 6 --dim 512 --auto_batch_size
+    
+    # Resume training from checkpoint
+    python cli.py train --vad_root datasets \
+        --train_manifest datasets/manifest_train.csv \
+        --val_manifest datasets/manifest_val.csv \
+        --ckpt_path lightning_logs/version_0/checkpoints/epoch=05-val_loss=0.1234.ckpt
+
+===========================================================================
+5. MODEL EVALUATION
+===========================================================================
+
+The evaluate command tests a trained model and generates performance metrics.
+
+Basic usage:
+    python cli.py evaluate --model_path PATH_TO_MODEL_CHECKPOINT
+
+Required Arguments:
+    --model_path PATH       Path to trained model checkpoint
+
+Data Arguments:
+    --test_root DIR         Root directory for test data (default: datasets)
+    --test_manifest PATH    Path to test manifest CSV
+    --n_test N              Number of test samples (if preparing data, default: 500)
+    --prepare_data          Prepare test data before evaluation
+
+Model Parameters:
+    --n_mels N              Number of mel bands (default: 80)
+    --n_fft N               FFT size (default: 512)
+    --hop N                 Hop length (default: 160)
+
+Evaluation Settings:
+    --batch_size N          Batch size for evaluation (default: 4)
+    --device DEVICE         Device to run on (cuda/cpu)
+    --output_dir DIR        Directory for results (default: eval_results)
+    --num_workers N         Number of data loading workers (default: 4)
+    --max_frames N          Maximum frames per sequence (default: 2000)
+    --use_mel_cache         Use cached mel spectrograms
+    --mel_cache_dir DIR     Directory for cached mels (default: mel_cache)
+    --two_stage_eval        Use separate validation set for threshold tuning
+    --n_validation N        Number of validation samples (default: 500)
+    --boundary_analysis     Perform detailed speech boundary analysis
+    --transition_window N   Window size for transition analysis (default: 10)
+
+Examples:
+    # Basic evaluation with existing test manifest
+    python cli.py evaluate --model_path lightning_logs/version_0/checkpoints/best.ckpt \
+        --test_manifest datasets/manifest_test.csv
+    
+    # Evaluate and prepare test data
+    python cli.py evaluate --model_path lightning_logs/version_0/checkpoints/best.ckpt \
+        --test_root datasets --prepare_data
+    
+    # Detailed evaluation with boundary analysis
+    python cli.py evaluate --model_path lightning_logs/version_0/checkpoints/best.ckpt \
+        --test_manifest datasets/manifest_test.csv \
+        --output_dir detailed_eval --boundary_analysis
+    
+    # Two-stage evaluation (better threshold selection)
+    python cli.py evaluate --model_path lightning_logs/version_0/checkpoints/best.ckpt \
+        --test_root datasets --prepare_data --two_stage_eval
+
+===========================================================================
+6. INFERENCE
+===========================================================================
+
+The inference command runs a trained model on audio files to detect speech.
+
+Basic usage:
+    python cli.py inference --model_path PATH_TO_MODEL --input_files FILE1 [FILE2 ...]
+
+Required Arguments (one of these):
+    --input_dir DIR         Directory of audio files to process
+    --input_files FILES     List of audio file paths to process
+
+Model Arguments:
+    --model_path PATH       Path to trained model (.ckpt or .pt) (required)
+
+Optional Arguments:
+    --labels_dir DIR        Directory with frame label files (for computing metrics)
+    --sample_rate RATE      Audio sample rate (default: 16000)
+    --n_fft N               FFT size (default: 512)
+    --hop_length N          Hop length (default: 160)
+    --win_length N          Window length (default: 512)
+    --n_mels N              Number of mel bands (default: 80)
+    --batch_size N          Batch size for processing (default: 4)
+    --device DEVICE         Device to run on (cuda/cpu)
+    --output_dir DIR        Directory to save predictions
+
+Examples:
+    # Process a single audio file
+    python cli.py inference --model_path vad_model.pt --input_files audio.wav
+    
+    # Process all audio files in a directory
+    python cli.py inference --model_path vad_model.pt --input_dir audio_files/
+    
+    # Process files and save predictions
+    python cli.py inference --model_path vad_model.pt --input_dir audio_files/ \
+        --output_dir predictions/
+    
+    # Compute metrics if ground truth is available
+    python cli.py inference --model_path vad_model.pt --input_dir test_audio/ \
+        --labels_dir test_audio_labels/
+
+===========================================================================
+7. COMMON WORKFLOWS
+===========================================================================
+
+Complete Pipeline (from data preparation to inference):
+------------------------------------------------------
+1. Prepare data:
+   python cli.py prepare --root datasets --splits train val test
+
+2. Train model:
+   python cli.py train --vad_root datasets \
+       --train_manifest datasets/manifest_train.csv \
+       --val_manifest datasets/manifest_val.csv \
+       --export_model
+
+3. Evaluate model:
+   python cli.py evaluate --model_path lightning_logs/version_0/checkpoints/best.ckpt \
+       --test_manifest datasets/manifest_test.csv
+
+4. Run inference:
+   python cli.py inference --model_path vad_model.pt --input_dir my_audio_files/
+
+Quick Start (smaller dataset, faster training):
+----------------------------------------------
+1. Prepare smaller dataset:
+   python cli.py prepare --root datasets --splits train val \
+       --n_pos 500 --n_neg 500 --duration_range 3 6
+
+2. Train simplified model:
+   python cli.py train --vad_root datasets \
+       --train_manifest datasets/manifest_train.csv \
+       --val_manifest datasets/manifest_val.csv \
+       --max_epochs 10 --n_layers 2 --dim 256 --export_model
+
+3. Run inference:
+   python cli.py inference --model_path vad_model.pt --input_files audio.wav
+
+===========================================================================
+8. TROUBLESHOOTING
+===========================================================================
+
+Common Issues:
+-------------
+1. "No such file or directory" for manifest files
+   - Make sure to run the prepare command before training
+   - Check paths are correct
+
+2. CUDA out of memory errors
+   - Reduce batch size (--batch_size)
+   - Reduce model size (--dim, --n_layers)
+   - Try --auto_batch_size option
+
+3. Slow data loading
+   - Use --use_mel_cache to cache spectrograms
+   - Increase --num_workers (except on Windows)
+
+4. Windows-specific issues
+   - Set --num_workers=0 on Windows
+
+5. Poor model performance
+   - Increase training data with --n_pos and --n_neg
+   - Train longer with --max_epochs
+   - Try --two_stage_eval for better threshold selection
+
+For more help:
+   Review the code documentation or open an issue on the project repository.

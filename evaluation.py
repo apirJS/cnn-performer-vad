@@ -2,19 +2,16 @@
 # ───────────────────────────────────────────────────────────────────────
 #  evaluation.py - Metrics visualization for MEL-spectrogram VAD model
 # ───────────────────────────────────────────────────────────────────────
-import argparse
-import csv
-import random
-import pathlib
-import subprocess
-import sys
-import json
-import logging
-import time
-import os
-import matplotlib.pyplot as plt
-import seaborn as sns
-from typing import List, Tuple, Optional
+from config import (
+    DEFAULT_N_MELS,
+    DEFAULT_N_FFT,
+    DEFAULT_HOP_LENGTH,
+    DEFAULT_SAMPLE_RATE,
+    DEFAULT_MAX_FRAMES,
+    DEFAULT_CACHE_DIR,
+    DEFAULT_BATCH_SIZE,
+)
+
 from sklearn.metrics import (
     roc_curve,
     precision_recall_curve,
@@ -23,25 +20,25 @@ from sklearn.metrics import (
     f1_score,
 )
 
-import numpy as np
-import torch
-import torchaudio
 from torch.utils.data import DataLoader
 
-import librosa
-import soundfile as sf
-import pytorch_lightning as pl
+import argparse
+import csv
+import random
+import pathlib
+import sys
+import json
+import logging
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import torch
 
-# Import model and dataset definitions from train.py
-from train import (
-    VADLightning,
-    CSVMelDataset,
-    collate_pad,
-    download_and_extract,
-    download_file,
-    make_pos_neg,
-    seed_everything,
-)
+# Import from train.py and prepare_data.py
+from data import CSVMelDataset, collate_pad
+from models import VADLightning
+
+from prepare_data import seed_everything, prepare_dataset
 
 # Configure logging
 logging.basicConfig(
@@ -50,10 +47,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-# Define URLs (same as in prompt)
-TEST_CLEAN_URL = "https://www.openslr.org/resources/12/test-clean.tar.gz"
-MUSAN_URL = "https://www.openslr.org/resources/17/musan.tar.gz"
 
 
 def get_dataset_paths(root):
@@ -73,114 +66,50 @@ def prepare_test_data(args):
     """Download, extract, and prepare audio data for VAD evaluation."""
     logger.info("Starting test data preparation process")
 
-    paths = get_dataset_paths(args.test_root)
-    root = paths["root"]
-    root.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Using root directory: {root}")
+    # Use the new modular preparation function
+    manifest_path = prepare_dataset(
+        args.test_root,
+        split="test",
+        n_pos=args.n_test,
+        n_neg=args.n_test,
+        duration_range=args.duration_range,
+        sample_rate=args.sample_rate,
+        force_rebuild=args.prepare_data,  # Only force rebuild if explicitly requested
+    )
 
-    # Track state in a JSON file
-    state_file = root / "evaluation_state.json"
-    state = {}
-    if state_file.exists():
-        try:
-            with open(state_file, "r") as f:
-                state = json.load(f)
-            logger.info(f"Found existing preparation state: {state}")
-        except Exception as e:
-            logger.error(f"Error loading state file: {e}")
+    return manifest_path
 
-    # Early check if data directories already exist
-    test_clean_dir = root / "LibriSpeech" / "test-clean"
-    musan_dir = root / "musan"
 
-    if test_clean_dir.exists() and musan_dir.exists():
-        logger.info("LibriSpeech test-clean and MUSAN directories already exist")
-        # Ensure state reflects that downloads are complete
-        if not state.get("downloads_complete", False):
-            logger.info("Updating state file to reflect existing data")
-            state["downloads_complete"] = True
-            with open(state_file, "w") as f:
-                json.dump(state, f)
-        logger.info("Skipping download step")
-    # Download data if not already done
-    elif not state.get("downloads_complete", False):
-        logger.info("Beginning download of LibriSpeech test-clean and MUSAN datasets")
-        logger.info(f"Processing LibriSpeech URL: {TEST_CLEAN_URL}")
-        download_and_extract(TEST_CLEAN_URL, root)
-        logger.info(f"Processing MUSAN URL: {MUSAN_URL}")
-        download_and_extract(MUSAN_URL, root)
-        state["downloads_complete"] = True
-        with open(state_file, "w") as f:
-            json.dump(state, f)
-        logger.info("All downloads completed successfully")
-    else:
-        # Verify files actually exist even if state claims downloads are complete
-        if not test_clean_dir.exists() or not musan_dir.exists():
-            logger.warning(
-                "State claims downloads complete, but directories are missing!"
-            )
-            logger.info("Resetting state and starting downloads again")
-            state["downloads_complete"] = False
+def prepare_validation_test_split(args):
+    """Prepare separate validation and test sets for unbiased evaluation."""
+    logger.info("Preparing separate validation and test sets")
 
-            # Download missing directories
-            if not test_clean_dir.exists():
-                logger.info("LibriSpeech test-clean missing, downloading...")
-                download_and_extract(TEST_CLEAN_URL, root)
+    # Prepare validation data for threshold tuning
+    val_manifest = prepare_dataset(
+        args.test_root,
+        split="validation",
+        n_pos=args.n_validation,
+        n_neg=args.n_validation,
+        duration_range=args.duration_range,
+        sample_rate=args.sample_rate,
+        force_rebuild=args.prepare_data,
+    )
 
-            if not musan_dir.exists():
-                logger.info("MUSAN directory missing, downloading...")
-                download_and_extract(MUSAN_URL, root)
+    # Prepare test data for final evaluation
+    test_manifest = prepare_dataset(
+        args.test_root,
+        split="test",
+        n_pos=args.n_test,
+        n_neg=args.n_test,
+        duration_range=args.duration_range,
+        sample_rate=args.sample_rate,
+        force_rebuild=args.prepare_data,
+    )
 
-            state["downloads_complete"] = True
-            with open(state_file, "w") as f:
-                json.dump(state, f)
-            logger.info("Missing files downloaded successfully")
-        else:
-            logger.info("Downloads already completed and files exist, skipping")
+    logger.info(f"Created validation manifest with {args.n_validation*2} samples")
+    logger.info(f"Created test manifest with {args.n_test*2} samples")
 
-    # Generate positive/negative samples if not done
-    if not state.get("samples_generated", False):
-        logger.info("Generating test positive and negative audio samples")
-        libri_root = root / "LibriSpeech" / "test-clean"
-        musan_root = root / "musan"
-        prep = root / "prepared"
-
-        # Updated paths for test split
-        test_pos, test_neg = prep / "test" / "pos", prep / "test" / "neg"
-
-        make_pos_neg(
-            libri_root,
-            musan_root,
-            test_pos,
-            test_neg,
-            args.n_test,  # Equal number of positives and negatives
-            args.n_test,
-            duration_range=args.duration_range,
-            sample_rate=args.sample_rate,
-            split_name="test",  # Add split name
-        )
-        state["samples_generated"] = True
-        with open(state_file, "w") as f:
-            json.dump(state, f)
-        logger.info("Sample generation completed")
-    else:
-        logger.info("Test samples already generated, skipping")
-
-    # Create test manifest if not done
-    if not state.get("manifest_created", False):
-        logger.info("Creating test manifest")
-        create_test_manifest(root / "prepared" / "test", root / "manifest_test.csv")
-        state["manifest_created"] = True
-        with open(state_file, "w") as f:
-            json.dump(state, f)
-        logger.info("Manifest creation completed")
-    else:
-        logger.info("Test manifest already created, skipping")
-
-    logger.info("✅ Test data preparation completed successfully")
-    print("✅ Test data ready")
-
-    return root / "manifest_test.csv"
+    return val_manifest, test_manifest
 
 
 def create_test_manifest(prep_dir: pathlib.Path, manifest_path: pathlib.Path):
@@ -311,7 +240,263 @@ def evaluate_model(model_path, test_manifest, args):
     return frame_preds, frame_labels, clip_preds, clip_labels
 
 
-def plot_metrics(frame_preds, frame_labels, clip_preds, clip_labels, output_dir):
+def find_segments(binary_sequence):
+    """Find continuous segments in a binary sequence.
+
+    Returns a list of tuples (start_idx, end_idx) for each segment.
+    """
+    segments = []
+    in_segment = False
+    start = 0
+
+    for i, val in enumerate(binary_sequence):
+        if val and not in_segment:
+            # Start of new segment
+            in_segment = True
+            start = i
+        elif not val and in_segment:
+            # End of segment
+            segments.append((start, i - 1))
+            in_segment = False
+
+    # Handle case where sequence ends during a segment
+    if in_segment:
+        segments.append((start, len(binary_sequence) - 1))
+
+    return segments
+
+
+def analyze_speech_boundaries(
+    frame_preds, frame_labels, threshold=0.5, tolerance_frames=3
+):
+    """Analyze speech boundary detection performance.
+
+    Args:
+        frame_preds: Frame-level prediction scores (0-1)
+        frame_labels: Ground truth frame labels (0 or 1)
+        threshold: Classification threshold
+        tolerance_frames: Number of frames allowed for boundary error
+
+    Returns:
+        Dictionary of boundary metrics
+    """
+    logger.info("Analyzing speech boundary detection performance")
+    boundary_metrics = {}
+
+    # Convert to binary predictions
+    binary_preds = (frame_preds > threshold).astype(int)
+
+    # Group frame sequences by continuous clips
+    # For this demo, we'll assume all frames are from a single continuous sequence
+    # In a real implementation, you'd need to process each clip separately
+
+    # Find true speech segments
+    true_segments = find_segments(frame_labels > 0.5)
+    logger.info(f"Found {len(true_segments)} true speech segments")
+
+    # Find predicted speech segments
+    pred_segments = find_segments(binary_preds)
+    logger.info(f"Found {len(pred_segments)} predicted speech segments")
+
+    # Count matched segments (with overlap)
+    matched_true_segments = 0
+    matched_pred_segments = 0
+
+    # Calculate boundary metrics
+    onset_errors = []  # Frames of error at speech onset
+    offset_errors = []  # Frames of error at speech offset
+
+    # For each true segment, find the best matching predicted segment
+    for true_start, true_end in true_segments:
+        best_iou = 0
+        best_pred_segment = None
+
+        for pred_start, pred_end in pred_segments:
+            # Calculate overlap
+            overlap_start = max(true_start, pred_start)
+            overlap_end = min(true_end, pred_end)
+
+            if overlap_start <= overlap_end:  # There is overlap
+                # Calculate IoU (Intersection over Union)
+                intersection = overlap_end - overlap_start + 1
+                union = (
+                    (true_end - true_start + 1)
+                    + (pred_end - pred_start + 1)
+                    - intersection
+                )
+                iou = intersection / union
+
+                if iou > best_iou:
+                    best_iou = iou
+                    best_pred_segment = (pred_start, pred_end)
+
+        # If we found a matching segment
+        if best_iou > 0.5:  # Consider it a match if IoU > 0.5
+            matched_true_segments += 1
+
+            # Calculate boundary errors
+            pred_start, pred_end = best_pred_segment
+            onset_error = pred_start - true_start  # Positive means late detection
+            offset_error = pred_end - true_end  # Positive means late cutoff
+
+            onset_errors.append(onset_error)
+            offset_errors.append(offset_error)
+
+    # Count matched predicted segments
+    for pred_start, pred_end in pred_segments:
+        for true_start, true_end in true_segments:
+            # Calculate overlap
+            overlap_start = max(true_start, pred_start)
+            overlap_end = min(true_end, pred_end)
+
+            if overlap_start <= overlap_end:  # There is overlap
+                # Calculate IoU
+                intersection = overlap_end - overlap_start + 1
+                union = (
+                    (true_end - true_start + 1)
+                    + (pred_end - pred_start + 1)
+                    - intersection
+                )
+                iou = intersection / union
+
+                if iou > 0.5:  # Consider it a match if IoU > 0.5
+                    matched_pred_segments += 1
+                    break
+
+    # Calculate metrics
+    boundary_metrics["total_true_segments"] = len(true_segments)
+    boundary_metrics["total_pred_segments"] = len(pred_segments)
+    boundary_metrics["matched_true_segments"] = matched_true_segments
+    boundary_metrics["matched_pred_segments"] = matched_pred_segments
+
+    # Segment-level metrics
+    boundary_metrics["segment_recall"] = matched_true_segments / max(
+        1, len(true_segments)
+    )
+    boundary_metrics["segment_precision"] = matched_pred_segments / max(
+        1, len(pred_segments)
+    )
+
+    if matched_true_segments > 0:
+        boundary_metrics["segment_f1"] = (
+            2
+            * boundary_metrics["segment_recall"]
+            * boundary_metrics["segment_precision"]
+            / (
+                boundary_metrics["segment_recall"]
+                + boundary_metrics["segment_precision"]
+            )
+        )
+    else:
+        boundary_metrics["segment_f1"] = 0.0
+
+    # Boundary timing metrics
+    if onset_errors:
+        boundary_metrics["mean_onset_error"] = np.mean(onset_errors)
+        boundary_metrics["mean_abs_onset_error"] = np.mean(np.abs(onset_errors))
+        boundary_metrics["max_onset_error"] = np.max(np.abs(onset_errors))
+
+    if offset_errors:
+        boundary_metrics["mean_offset_error"] = np.mean(offset_errors)
+        boundary_metrics["mean_abs_offset_error"] = np.mean(np.abs(offset_errors))
+        boundary_metrics["max_offset_error"] = np.max(np.abs(offset_errors))
+
+    return boundary_metrics
+
+
+def plot_transition_errors(
+    frame_preds, frame_labels, output_dir, threshold=0.5, window=10
+):
+    """Visualize error patterns around speech transitions.
+
+    Args:
+        frame_preds: Frame-level prediction scores
+        frame_labels: Ground truth frame labels
+        output_dir: Directory to save visualization
+        threshold: Classification threshold
+        window: Window size around transitions to analyze
+    """
+    logger.info("Analyzing errors around speech transitions")
+    output_dir = pathlib.Path(output_dir)
+
+    # Convert to binary predictions
+    binary_preds = (frame_preds > threshold).astype(int)
+
+    # Find transitions in ground truth
+    transitions = []
+    transition_types = []  # 1 for onset, 0 for offset
+
+    for i in range(1, len(frame_labels)):
+        if frame_labels[i] != frame_labels[i - 1]:
+            transitions.append(i)
+            transition_types.append(1 if frame_labels[i] > 0.5 else 0)
+
+    logger.info(f"Found {len(transitions)} speech transitions")
+
+    if not transitions:
+        logger.warning("No transitions found, skipping transition analysis")
+        return
+
+    # Collect prediction errors around transitions
+    onset_errors = []  # Errors around speech onset
+    offset_errors = []  # Errors around speech offset
+
+    for t, t_type in zip(transitions, transition_types):
+        # Get window around transition
+        start = max(0, t - window)
+        end = min(len(frame_labels), t + window)
+
+        # Get prediction errors in window
+        window_preds = binary_preds[start:end]
+        window_labels = frame_labels[start:end]
+        window_errors = (window_preds != window_labels).astype(float)
+
+        # Align all windows so transition is at index 'window'
+        aligned_errors = np.zeros(2 * window)
+        offset = window - (t - start)  # Adjust for truncated windows
+        aligned_errors[offset : offset + (end - start)] = window_errors
+
+        if t_type == 1:  # onset
+            onset_errors.append(aligned_errors)
+        else:  # offset
+            offset_errors.append(aligned_errors)
+
+    # Average errors at each position relative to transition
+    mean_onset_errors = (
+        np.mean(onset_errors, axis=0) if onset_errors else np.zeros(2 * window)
+    )
+    mean_offset_errors = (
+        np.mean(offset_errors, axis=0) if offset_errors else np.zeros(2 * window)
+    )
+
+    # Plot
+    plt.figure(figsize=(12, 6))
+    x = np.arange(-window, window)
+    plt.plot(x, mean_onset_errors, label="Speech Onset Errors", color="blue")
+    plt.plot(x, mean_offset_errors, label="Speech Offset Errors", color="red")
+    plt.axvline(x=0, color="k", linestyle="--", alpha=0.5)
+    plt.xlabel("Frames relative to transition (0 = transition point)")
+    plt.ylabel("Error rate")
+    plt.title("VAD Errors Around Speech Transitions")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_dir / "transition_errors.png", dpi=300)
+    plt.close()
+
+    logger.info(
+        f"Transition error analysis saved to {output_dir / 'transition_errors.png'}"
+    )
+
+
+def plot_metrics(
+    frame_preds,
+    frame_labels,
+    clip_preds,
+    clip_labels,
+    output_dir,
+    fixed_thresholds=None,
+):
     """Generate and save visualization of various metrics."""
     logger.info("Generating performance visualizations")
     output_dir = pathlib.Path(output_dir)
@@ -360,21 +545,30 @@ def plot_metrics(frame_preds, frame_labels, clip_preds, clip_labels, output_dir)
 
     # 3. Confusion Matrix at optimal threshold
     logger.info("Creating frame-level confusion matrix at optimal threshold")
-    # Find threshold that maximizes F1 score
-    f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
-    optimal_idx = np.argmax(f1_scores)
-    optimal_threshold = (
-        thresholds[optimal_idx] if optimal_idx < len(thresholds) else 0.5
-    )
+    # Find threshold that maximizes F1 score, or use fixed threshold if provided
+    if fixed_thresholds and "frame" in fixed_thresholds:
+        optimal_threshold = fixed_thresholds["frame"]
+        logger.info(f"Using fixed frame threshold: {optimal_threshold}")
+    else:
+        f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
+        optimal_idx = np.argmax(f1_scores)
+        optimal_threshold = (
+            thresholds[optimal_idx] if optimal_idx < len(thresholds) else 0.5
+        )
+        logger.info(f"Found optimal frame threshold: {optimal_threshold}")
 
     binary_preds = (frame_preds >= optimal_threshold).astype(int)
     cm = confusion_matrix(frame_labels, binary_preds)
-    
+
     # Calculate correct F1 score from confusion matrix elements
     tn, fp, fn, tp = cm.ravel()
     precision_from_cm = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall_from_cm = tp / (tp + fn) if (tp + fn) > 0 else 0
-    frame_f1 = 2 * precision_from_cm * recall_from_cm / (precision_from_cm + recall_from_cm) if (precision_from_cm + recall_from_cm) > 0 else 0
+    frame_f1 = (
+        2 * precision_from_cm * recall_from_cm / (precision_from_cm + recall_from_cm)
+        if (precision_from_cm + recall_from_cm) > 0
+        else 0
+    )
 
     plt.figure(figsize=(10, 8))
     sns.heatmap(
@@ -503,15 +697,20 @@ def plot_metrics(frame_preds, frame_labels, clip_preds, clip_labels, output_dir)
     plt.close()
 
     # 3. Find optimal clip threshold and create confusion matrix
-    clip_f1_scores = (
-        2 * clip_precision * clip_recall / (clip_precision + clip_recall + 1e-10)
-    )
-    clip_optimal_idx = np.argmax(clip_f1_scores)
-    clip_optimal_threshold = (
-        clip_pr_thresholds[clip_optimal_idx]
-        if clip_optimal_idx < len(clip_pr_thresholds)
-        else 0.5
-    )
+    if fixed_thresholds and "clip" in fixed_thresholds:
+        clip_optimal_threshold = fixed_thresholds["clip"]
+        logger.info(f"Using fixed clip threshold: {clip_optimal_threshold}")
+    else:
+        clip_f1_scores = (
+            2 * clip_precision * clip_recall / (clip_precision + clip_recall + 1e-10)
+        )
+        clip_optimal_idx = np.argmax(clip_f1_scores)
+        clip_optimal_threshold = (
+            clip_pr_thresholds[clip_optimal_idx]
+            if clip_optimal_idx < len(clip_pr_thresholds)
+            else 0.5
+        )
+        logger.info(f"Found optimal clip threshold: {clip_optimal_threshold}")
 
     clip_binary_preds = (clip_preds >= clip_optimal_threshold).astype(int)
     clip_cm = confusion_matrix(clip_labels, clip_binary_preds)
@@ -649,7 +848,7 @@ def main():
     parser.add_argument(
         "--sample_rate",
         type=int,
-        default=16000,
+        default=DEFAULT_SAMPLE_RATE,
         help="Sample rate for audio processing",
     )
 
@@ -661,13 +860,16 @@ def main():
         "--test_manifest", help="Path to test manifest CSV (if already created)"
     )
     parser.add_argument(
-        "--n_mels", type=int, default=80, help="Number of mel bands in spectrogram"
+        "--n_mels",
+        type=int,
+        default=DEFAULT_N_MELS,
+        help="Number of mel bands in spectrogram",
     )
     parser.add_argument(
-        "--n_fft", type=int, default=400, help="FFT size for spectrogram"
+        "--n_fft", type=int, default=DEFAULT_N_FFT, help="FFT size for spectrogram"
     )
     parser.add_argument(
-        "--hop", type=int, default=160, help="Hop length for spectrogram"
+        "--hop", type=int, default=DEFAULT_HOP_LENGTH, help="Hop length for spectrogram"
     )
     parser.add_argument(
         "--device",
@@ -675,7 +877,10 @@ def main():
         help="Device to run evaluation on",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=8, help="Batch size for evaluation"
+        "--batch_size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="Batch size for evaluation",
     )
     parser.add_argument(
         "--num_workers", type=int, default=4, help="Number of data loading workers"
@@ -683,7 +888,7 @@ def main():
     parser.add_argument(
         "--max_frames",
         type=int,
-        default=2000,
+        default=DEFAULT_MAX_FRAMES,
         help="Maximum number of frames per sequence",
     )
     parser.add_argument(
@@ -693,10 +898,9 @@ def main():
     )
     parser.add_argument(
         "--mel_cache_dir",
-        default="test_mel_cache",
+        default=DEFAULT_CACHE_DIR,
         help="Directory to cache mel spectrograms",
     )
-
     # Output arguments
     parser.add_argument(
         "--output_dir",
@@ -705,6 +909,29 @@ def main():
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
+    # Add after other parser arguments
+    parser.add_argument(
+        "--two_stage_eval",
+        action="store_true",
+        help="Use separate validation set for threshold tuning",
+    )
+    parser.add_argument(
+        "--n_validation",
+        type=int,
+        default=500,
+        help="Number of validation samples for threshold tuning",
+    )
+    parser.add_argument(
+        "--boundary_analysis",
+        action="store_true",
+        help="Perform detailed speech boundary detection analysis",
+    )
+    parser.add_argument(
+        "--transition_window",
+        type=int,
+        default=10,
+        help="Window size (frames) for transition analysis",
     )
 
     args = parser.parse_args()
@@ -721,33 +948,133 @@ def main():
     # Set random seed
     seed_everything(args.seed)
 
-    # Prepare test data if needed
-    if args.prepare_data or not args.test_manifest:
-        logger.info("Preparing test data")
-        test_manifest = prepare_test_data(args)
-        args.test_manifest = str(test_manifest)
-
-    # Check if test manifest exists
-    if not pathlib.Path(args.test_manifest).exists():
-        logger.error(f"Test manifest missing: {args.test_manifest}")
-        sys.exit("❌ Test manifest missing. Use --prepare_data first.")
+    # Create output directory
+    output_dir = pathlib.Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Check if model exists
     if not pathlib.Path(args.model_path).exists():
         logger.error(f"Model checkpoint missing: {args.model_path}")
         sys.exit("❌ Model checkpoint missing.")
 
-    # Evaluate model
-    logger.info("Starting model evaluation")
-    frame_preds, frame_labels, clip_preds, clip_labels = evaluate_model(
-        args.model_path, args.test_manifest, args
-    )
+    # For two-stage evaluation, prepare validation and test sets separately
+    if args.two_stage_eval:
+        logger.info("Using two-stage evaluation with separate validation set")
+        val_manifest, test_manifest = prepare_validation_test_split(args)
+        args.val_manifest = str(val_manifest)
+        args.test_manifest = str(test_manifest)
 
-    # Generate visualizations
-    logger.info("Generating metrics visualizations")
-    metrics = plot_metrics(
-        frame_preds, frame_labels, clip_preds, clip_labels, args.output_dir
-    )
+        # Check if manifests exist
+        for manifest, name in [
+            (args.val_manifest, "Validation"),
+            (args.test_manifest, "Test"),
+        ]:
+            if not pathlib.Path(manifest).exists():
+                logger.error(f"{name} manifest missing: {manifest}")
+                sys.exit(f"❌ {name} manifest missing. Use --prepare_data first.")
+
+        # Evaluate on validation set to find optimal thresholds
+        logger.info("Evaluating model on validation set")
+        val_frame_preds, val_frame_labels, val_clip_preds, val_clip_labels = (
+            evaluate_model(args.model_path, args.val_manifest, args)
+        )
+
+        # Find optimal thresholds on validation set
+        logger.info("Finding optimal thresholds on validation set")
+        val_metrics = plot_metrics(
+            val_frame_preds,
+            val_frame_labels,
+            val_clip_preds,
+            val_clip_labels,
+            output_dir / "validation",
+        )
+
+        # Get optimal thresholds from validation
+        fixed_thresholds = {
+            "frame": val_metrics["frame_level"]["optimal_threshold"],
+            "clip": val_metrics["clip_level"]["optimal_threshold"],
+        }
+
+        # Now evaluate on test set with fixed thresholds
+        logger.info("Evaluating model on test set with validation-derived thresholds")
+        test_frame_preds, test_frame_labels, test_clip_preds, test_clip_labels = (
+            evaluate_model(args.model_path, args.test_manifest, args)
+        )
+
+        metrics = plot_metrics(
+            test_frame_preds,
+            test_frame_labels,
+            test_clip_preds,
+            test_clip_labels,
+            output_dir / "test",
+            fixed_thresholds=fixed_thresholds,
+        )
+
+    else:
+        # Original single-stage evaluation
+        if args.prepare_data or not args.test_manifest:
+            logger.info("Preparing test data")
+            test_manifest = prepare_test_data(args)
+            args.test_manifest = str(test_manifest)
+
+        # Check if test manifest exists
+        if not pathlib.Path(args.test_manifest).exists():
+            logger.error(f"Test manifest missing: {args.test_manifest}")
+            sys.exit("❌ Test manifest missing. Use --prepare_data first.")
+
+        # Evaluate model
+        logger.info("Starting model evaluation")
+        frame_preds, frame_labels, clip_preds, clip_labels = evaluate_model(
+            args.model_path, args.test_manifest, args
+        )
+
+        # Generate visualizations
+        logger.info("Generating metrics visualizations")
+        metrics = plot_metrics(
+            frame_preds, frame_labels, clip_preds, clip_labels, output_dir
+        )
+
+        # Store for additional analysis
+        test_frame_preds = frame_preds
+        test_frame_labels = frame_labels
+
+    # Perform boundary analysis if requested
+    if args.boundary_analysis:
+        logger.info("Performing speech boundary analysis")
+        # Use threshold from metrics for consistency
+        threshold = metrics["frame_level"]["optimal_threshold"]
+        boundary_metrics = analyze_speech_boundaries(
+            test_frame_preds, test_frame_labels, threshold=threshold
+        )
+
+        # Save boundary metrics
+        with open(output_dir / "boundary_metrics.json", "w") as f:
+            json.dump(boundary_metrics, f, indent=4)
+
+        # Plot transition error patterns
+        plot_transition_errors(
+            test_frame_preds,
+            test_frame_labels,
+            output_dir,
+            threshold=threshold,
+            window=args.transition_window,
+        )
+
+        # Print boundary metrics
+        print(f"\n🔍 Boundary Detection Analysis:")
+        print(f"  - Segment F1 Score: {boundary_metrics.get('segment_f1', 'N/A'):.4f}")
+        print(
+            f"  - Segments: {boundary_metrics.get('matched_true_segments', 0)}/{boundary_metrics.get('total_true_segments', 0)} matched"
+        )
+
+        if "mean_abs_onset_error" in boundary_metrics:
+            print(
+                f"  - Mean onset error: {boundary_metrics['mean_abs_onset_error']:.2f} frames"
+            )
+        if "mean_abs_offset_error" in boundary_metrics:
+            print(
+                f"  - Mean offset error: {boundary_metrics['mean_abs_offset_error']:.2f} frames"
+            )
 
     # Print summary
     print(f"\n✅ Evaluation complete!")
