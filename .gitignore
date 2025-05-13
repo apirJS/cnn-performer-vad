@@ -3,3 +3,5 @@ venv
 vad_corpus
 dataset
 cache
+datasets
+__pycache__

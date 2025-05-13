@@ -68,6 +68,7 @@ def initialize_silero_vad(
             force_reload=False,
             onnx=False,
             verbose=False,
+            trust_repo=True
         )
     else:
         logger.info("Downloading Silero VAD from torch hub")
@@ -78,6 +79,7 @@ def initialize_silero_vad(
             force_reload=force_reload,
             onnx=False,
             verbose=False,
+            trust_repo=True
         )
         model = model.to(device)
 
@@ -132,6 +134,7 @@ def generate_silero_vad_labels(
             onnx=False,
             verbose=False,
             utils_only=True,
+            trust_repo=True
         )["get_speech_timestamps"](
             audio_tensor,
             model,
@@ -257,48 +260,90 @@ def create_esc50_negative_sample(
 
 
 def process_vocalset(
-    root_dir: pathlib.Path, sample_rate: int = 16000
+    root_dir: pathlib.Path, 
+    split_name: str = "train",  # Add split parameter
+    sample_rate: int = 16000
 ) -> list[pathlib.Path]:
     """
-    Process VocalSet dataset and return paths to singing audio files.
-
+    Process VocalSet dataset with proper train/val/test splitting.
+    
     Args:
         root_dir: Root directory where dataset is extracted
+        split_name: Which split to use ('train', 'val', or 'test')
         sample_rate: Target sample rate
 
     Returns:
-        List of paths to singing/vocal audio files
+        List of paths to singing/vocal audio files for the requested split
     """
-    # Try to find VocalSet directory with a more flexible pattern
+    # Find VocalSet directory
     vocalset_dirs = list(root_dir.glob("*FULL*"))
+    
+    # If not found in the provided directory, check the parent directory
     if not vocalset_dirs:
-        logger.warning(f"VocalSet directory not found in {root_dir}")
+        parent_dir = root_dir.parent
+        logger.info(f"VocalSet not found in {root_dir}, checking parent directory {parent_dir}")
+        vocalset_dirs = list(parent_dir.glob("*FULL*"))
+    
+    if not vocalset_dirs:
+        logger.warning(f"VocalSet directory not found in {root_dir} or its parent")
         return []
 
     vocalset_dir = vocalset_dirs[0]
     logger.info(f"Processing VocalSet dataset from {vocalset_dir}")
-
-    # Find all WAV files
-    vocal_files = list(vocalset_dir.rglob("*.wav"))
-    logger.info(f"Found {len(vocal_files)} VocalSet audio files")
-
+    
+    # VocalSet has male and female singers, with IDs
+    # Create consistent splits by singer ID to avoid data leakage
+    
+    # Define singer IDs for each split
+    # There are 20 singers (10 male, 10 female), IDs from 1-10 for each gender
+    if split_name == "train":
+        # Use 14 singers for training (70%)
+        male_ids = [1, 2, 3, 4, 5, 6, 7]
+        female_ids = [1, 2, 3, 4, 5, 6, 7]
+    elif split_name == "val":
+        # Use 3 singers for validation (15%)
+        male_ids = [8, 9]
+        female_ids = [8]
+    else:  # test
+        # Use 3 singers for testing (15%)
+        male_ids = [10]
+        female_ids = [9, 10]
+    
+    # Create string patterns to match the correct singers
+    male_patterns = [f"male{id}_" for id in male_ids]
+    female_patterns = [f"female{id}_" for id in female_ids]
+    singer_patterns = male_patterns + female_patterns
+    
+    # Find all WAV files that match the singers for this split
+    vocal_files = []
+    all_files = list(vocalset_dir.rglob("*.wav"))
+    
+    for file in all_files:
+        file_str = str(file)
+        if any(pattern in file_str for pattern in singer_patterns):
+            vocal_files.append(file)
+    
+    logger.info(f"Found {len(vocal_files)} VocalSet audio files for {split_name} split")
     return vocal_files
 
 
 def process_esc50(
-    root_dir: pathlib.Path, sample_rate: int = 16000
+    root_dir: pathlib.Path, 
+    split_name: str = "train",  # Add split parameter
+    sample_rate: int = 16000
 ) -> list[pathlib.Path]:
     """
-    Process ESC-50 dataset and return paths to usable audio files for noise sources.
-
+    Process ESC-50 dataset with proper train/val/test splitting.
+    
     Args:
         root_dir: Root directory where dataset is extracted
+        split_name: Which split to use ('train', 'val', or 'test')
         sample_rate: Target sample rate
 
     Returns:
-        List of paths to noise audio files
+        List of paths to noise audio files for the requested split
     """
-    # Try to find the ESC-50 directory with a more flexible pattern
+    # Find the ESC-50 directory
     esc50_dirs = list(root_dir.glob("*ESC-50*"))
     if not esc50_dirs:
         logger.warning(f"ESC-50 directory not found in {root_dir}")
@@ -307,10 +352,9 @@ def process_esc50(
     esc50_dir = esc50_dirs[0]
     logger.info(f"Found ESC-50 directory at {esc50_dir}")
 
-    # ESC-50 audio is in the audio/ directory
+    # Find audio directory
     audio_dir = esc50_dir / "audio"
     if not audio_dir.exists():
-        # Try to find audio directory with a recursive search
         audio_dirs = list(esc50_dir.rglob("audio"))
         if audio_dirs:
             audio_dir = audio_dirs[0]
@@ -319,26 +363,37 @@ def process_esc50(
             logger.warning(f"ESC-50 audio directory not found at {esc50_dir}")
             return []
 
-    logger.info(f"Processing ESC-50 dataset from {audio_dir}")
-
     # Get all WAV files
     all_files = list(audio_dir.glob("*.wav"))
     logger.info(f"Found {len(all_files)} ESC-50 audio files")
 
-    # Filter out human vocal sounds to avoid false positives in VAD
-    # Categories to exclude (based on ESC-50 metadata):
-    # - Category 0: "human non-speech sounds" (coughing, sneezing, etc.)
-    # - Category 5: "human speech"
+    # Filter out human vocal sounds
     exclude_prefixes = ["0", "5"]
-
+    
+    # Map split name to fold numbers:
+    # - train: folds 1, 2, 3 (60%)
+    # - val: fold 4 (20%) 
+    # - test: fold 5 (20%)
+    if split_name == "train":
+        target_folds = ["1", "2", "3"]
+    elif split_name == "val":
+        target_folds = ["4"]
+    else:  # test
+        target_folds = ["5"]
+    
+    # Filter files by both category and fold
     noise_files = []
     for file in all_files:
         # ESC-50 filename format: {category}-{fold}-{ID}-{take}.wav
-        category = file.stem.split("-")[0]
-        if not any(category.startswith(prefix) for prefix in exclude_prefixes):
+        parts = file.stem.split("-")
+        category = parts[0]
+        fold = parts[1]
+        
+        # Check both category (not human sounds) and correct fold for this split
+        if not any(category.startswith(prefix) for prefix in exclude_prefixes) and fold in target_folds:
             noise_files.append(file)
 
-    logger.info(f"Selected {len(noise_files)} ESC-50 audio files as noise sources")
+    logger.info(f"Selected {len(noise_files)} ESC-50 audio files for {split_name} split")
     return noise_files
 
 
@@ -1081,36 +1136,90 @@ def create_clean_speech_sample(
 
 
 def process_musdb(
-    root_dir: pathlib.Path,
-    subset: str = "train",  # or "test"
+    root_dir: pathlib.Path, 
+    split_name: str = "train",  # Your split name: "train", "val", or "test"
     sample_rate: int = 16000,
 ) -> list[pathlib.Path]:
     """
-    Download ex MUSDB HQ and return local paths to mixture WAVs
-    resampled to the target sample_rate (written once, cached later).
+    Process MUSDB HQ dataset, properly handling train/val/test splits.
+    Returns paths to all WAV files found in the dataset.
     """
     musdb_root = root_dir / "MUSDB_HQ"
     musdb_root.mkdir(exist_ok=True, parents=True)
-
-    ds = MUSDB_HQ(
-        root=musdb_root,
-        subset=subset,
-        sources=["bass", "drums", "other"],
-        download=True,
-    )
-
-    mixture_paths: list[pathlib.Path] = []
-    for waveform, sr, _, track_name in ds:
-        out = musdb_root / f"{track_name}_mixture_{sample_rate//1000}k.wav"
-        if not out.exists():  # resample & cache
-            if sr != sample_rate:
-                import torchaudio.functional as F
-
-                waveform = F.resample(waveform, sr, sample_rate)
-            torchaudio.save(out, waveform, sample_rate)
-        mixture_paths.append(out)
-    return mixture_paths
-
+    
+    # Initialize the list to store file paths
+    music_files = []
+    
+    # Map our split names to MUSDB parameters
+    # For 'train': Use subset="train", split="train"
+    # For 'val': Use subset="train", split="validation"  
+    # For 'test': Use subset="test", split=None
+    if split_name == "train":
+        musdb_subset = "train"
+        musdb_split = "train"
+    elif split_name == "val":
+        musdb_subset = "train"
+        musdb_split = "validation"
+    else:  # test
+        musdb_subset = "test"
+        musdb_split = None
+    
+    logger.info(f"Loading MUSDB HQ data for {split_name} split (subset={musdb_subset}, split={musdb_split})")
+    
+    # Try to download MUSDB if not present
+    try:
+        # This will trigger download if needed
+        _ = MUSDB_HQ(
+            root=musdb_root, 
+            subset=musdb_subset, 
+            download=True, 
+            sources=["bass", "drums", "other"],
+            split=musdb_split
+        )
+    except Exception as e:
+        logger.error(f"Error accessing MUSDB HQ dataset: {e}")
+    
+    # MUSDB uses a specific directory structure, adapt our search to find the right files
+    if split_name == "train":
+        # For train split, look in train/train
+        search_dir = musdb_root / "train" / "train"
+    elif split_name == "val":
+        # For val split, look in train/validation
+        search_dir = musdb_root / "train" / "validation"
+    else:
+        # For test split, look in test
+        search_dir = musdb_root / "test"
+    
+    # Ensure the directory exists
+    if not search_dir.exists():
+        logger.warning(f"MUSDB directory not found: {search_dir}")
+        # Fall back to direct subset directories
+        if split_name == "test":
+            search_dir = musdb_root / "test"
+        else:
+            search_dir = musdb_root / "train"
+    
+    # Find all WAV files in the search directory
+    if search_dir.exists():
+        # Recursively find all .wav files (for all tracks and sources)
+        wav_files = list(search_dir.rglob("*.wav"))
+        # Filter for mixture files if you only want mixtures
+        # wav_files = [f for f in wav_files if "mixture" in str(f)]
+        music_files.extend(wav_files)
+        logger.info(f"Found {len(wav_files)} WAV files in {search_dir}")
+    
+    # Create fallback if no files found
+    if not music_files:
+        logger.warning(f"No MUSDB audio files found for {split_name} split. Creating fallback audio.")
+        fallback_path = musdb_root / f"fallback_audio_{split_name}_{sample_rate//1000}k.wav"
+        
+        # Create silent audio
+        fallback_audio = np.zeros(sample_rate * 10)  # 10 seconds, mono
+        sf.write(fallback_path, fallback_audio, sample_rate)
+        music_files = [fallback_path]
+    
+    logger.info(f"Using {len(music_files)} MUSDB audio files for {split_name} split")
+    return music_files
 
 def create_speech_music_sample_with_silero(
     speech_files, music_files, duration, sample_rate, win_length, hop_length, vad_model
@@ -1291,8 +1400,8 @@ def make_pos_neg(
     # With this:
     # Swap MUSAN music for MUSDB HQ mixtures
     musdb_music = process_musdb(
-        out_pos.parent.parent,  # reuse same root
-        subset="train" if split_name == "train" else "test",
+        out_pos.parent.parent.parent,  # reuse same root
+        split_name=split_name,
         sample_rate=sample_rate,
     )
     logger.info(f"Added {len(musdb_music)} MUSDB HQ mixture files as music sources")
@@ -1304,11 +1413,11 @@ def make_pos_neg(
     if use_additional_datasets:
         # Process ESC-50 for noise sources
         root_dir = out_pos.parent.parent
-        esc50_noise = process_esc50(root_dir, sample_rate)
+        esc50_noise = process_esc50(root_dir, sample_rate, split_name=split_name)
         logger.info(f"Added {len(esc50_noise)} ESC-50 noise files")
 
         # Process VocalSet for speech sources
-        vocalset_speech = process_vocalset(root_dir, sample_rate)
+        vocalset_speech = process_vocalset(root_dir, sample_rate, split_name=split_name)
         logger.info(f"Added {len(vocalset_speech)} VocalSet speech files")
 
     # Combine noise sources
@@ -1336,7 +1445,7 @@ def make_pos_neg(
             split=split_name,
             max_per_lang=max_per,
             shuffle_seed=42,
-            cache_dir=str(out_pos.parent.parent / "hf_cache"),
+            cache_dir=str(out_pos.parent.parent.parent / "hf_cache"),
         )
         logger.info(f"Added {len(fleurs_speech)} FLEURS speech files")
     elif speech_dir:
@@ -1418,8 +1527,11 @@ def make_pos_neg(
     # Create directories for audio and frame-level labels
     out_pos.mkdir(parents=True, exist_ok=True)
     out_neg.mkdir(parents=True, exist_ok=True)
-    out_pos_labels = out_pos.parent.parent / f"{split_name}_pos_labels"
-    out_neg_labels = out_neg.parent.parent / f"{split_name}_neg_labels"
+
+    labels_root = out_pos.parent  # == datasets/prepared/<split>
+    out_pos_labels = labels_root / "pos_labels"
+    out_neg_labels = labels_root / "neg_labels"
+
     out_pos_labels.mkdir(parents=True, exist_ok=True)
     out_neg_labels.mkdir(parents=True, exist_ok=True)
 
@@ -1980,11 +2092,11 @@ def create_manifest(
             # Detect if this is a positive sample by checking for "pos_" prefix
             is_speech = "pos_" in p.name
 
-            # Path to corresponding frame labels
-            label_dir = (
-                f"{split_name}_pos_labels" if is_speech else f"{split_name}_neg_labels"
-            )
-            frame_label_path = prep_dir.parent / label_dir / f"{p.stem}_labels.npy"
+            # now looks inside the split folder
+            label_dir = "pos_labels" if is_speech else "neg_labels"
+            frame_label_path = prep_dir / label_dir / f"{p.stem}_labels.npy"
+
+
             w.writerow([p, 1 if is_speech else 0, frame_label_path])
 
     logger.info(f"Created {split_name} manifest with {len(all_clips)} entries")
@@ -2162,7 +2274,7 @@ def main(args=None):
         parser.add_argument(
             "--splits",
             nargs="+",
-            default=["train", "val"],
+            default=["train", "val", "test"],
             choices=["train", "val", "test"],
             help="Dataset splits to prepare (train, val, and/or test)",
         )
@@ -2264,7 +2376,7 @@ def main(args=None):
         parser.add_argument(
             "--use_silero_vad",
             action="store_true",
-            default=False,
+            default=True,
             help="Use Silero VAD for generating frame-level labels",
         )
 

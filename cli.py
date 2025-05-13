@@ -51,7 +51,7 @@ def setup_prepare_parser(subparsers):
         "--duration_range",
         type=float,
         nargs=2,
-        default=[1, 12],
+        default=[1, 30],
         help="Min and max duration in seconds for audio clips",
     )
     parser.add_argument(
@@ -126,6 +126,12 @@ def setup_prepare_parser(subparsers):
         type=float,
         default=0.25,
         help="Fraction of negative samples that are music",
+    )
+    parser.add_argument(
+        "--use_silero_vad",
+        action="store_true",
+        default=True,
+        help="Use Silero VAD for generating frame-level labels",
     )
 
     return parser

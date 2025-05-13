@@ -349,7 +349,6 @@ def setup_trainer(args, callbacks):
         accelerator=accelerator,
         devices=args.gpus or 1,
         max_epochs=args.max_epochs,
-        precision=precision,
         callbacks=list(callbacks.values()),
         log_every_n_steps=25,
         accumulate_grad_batches=args.accumulate_grad_batches,
