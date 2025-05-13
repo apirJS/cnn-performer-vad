@@ -261,11 +261,11 @@ def create_esc50_negative_sample(
 
 def process_vocalset(
     root_dir: pathlib.Path, 
-    split_name: str = "train",  # Add split parameter
+    split_name: str = "train",
     sample_rate: int = 16000
 ) -> list[pathlib.Path]:
     """
-    Process VocalSet dataset with proper train/val/test splitting.
+    Process VocalSet dataset with train/val/test splitting based on defined singer lists.
     
     Args:
         root_dir: Root directory where dataset is extracted
@@ -275,65 +275,116 @@ def process_vocalset(
     Returns:
         List of paths to singing/vocal audio files for the requested split
     """
-    # Find VocalSet directory
-    vocalset_dirs = list(root_dir.glob("*FULL*"))
+    # 1. More flexible directory finding (keep as is)
+    possible_paths = [
+        root_dir / "FULL",
+        root_dir / "full",
+        root_dir / "VocalSet" / "FULL",
+        root_dir / "VocalSet-master" / "FULL",
+        root_dir.parent / "FULL",
+        root_dir.parent / "VocalSet" / "FULL"
+    ]
     
-    # If not found in the provided directory, check the parent directory
-    if not vocalset_dirs:
-        parent_dir = root_dir.parent
-        logger.info(f"VocalSet not found in {root_dir}, checking parent directory {parent_dir}")
-        vocalset_dirs = list(parent_dir.glob("*FULL*"))
+    glob_paths = list(root_dir.glob("**/[Ff][Uu][Ll][Ll]"))
+    glob_parent_paths = list(root_dir.parent.glob("**/[Ff][Uu][Ll][Ll]"))
     
-    if not vocalset_dirs:
-        logger.warning(f"VocalSet directory not found in {root_dir} or its parent")
+    all_possible_paths = possible_paths + glob_paths + glob_parent_paths
+    
+    # Find the first valid path
+    vocalset_dir = None
+    for path in all_possible_paths:
+        if path.exists():
+            vocalset_dir = path
+            logger.info(f"Found VocalSet directory at: {vocalset_dir}")
+            break
+    
+    if not vocalset_dir:
+        logger.warning("VocalSet directory not found after exhaustive search")
         return []
-
-    vocalset_dir = vocalset_dirs[0]
-    logger.info(f"Processing VocalSet dataset from {vocalset_dir}")
     
-    # VocalSet has male and female singers, with IDs
-    # Create consistent splits by singer ID to avoid data leakage
+    # 2. Find ALL wav files first
+    all_files = list(vocalset_dir.rglob("**/*.wav"))
+    logger.info(f"Found total of {len(all_files)} WAV files in VocalSet")
     
-    # Define singer IDs for each split
-    # There are 20 singers (10 male, 10 female), IDs from 1-10 for each gender
+    # Debug info on file locations
+    if len(all_files) > 0:
+        sample_files = random.sample(all_files, min(5, len(all_files)))
+        logger.info(f"Sample file paths: {[str(f) for f in sample_files]}")
+    
+    # 3. Define singer IDs based on the text files
+    # Test singers from test_singers.rtfd/TXT.rtf
+    test_singers = ["female2", "female8", "male3", "male5", "male10"]
+    
+    # Train singers from train_singers.rtfd/TXT.rtf
+    train_singers_full = [
+        "female1", "female3", "female4", "female5", "female6", "female7", "female9",
+        "male1", "male2", "male4", "male6", "male7", "male8", "male9", "male11"
+    ]
+    
+    # Split train singers into train and validation
+    # Use female9, male8, male9 for validation (like in original code)
+    val_singers = ["female9", "male8", "male9"]
+    train_singers = [s for s in train_singers_full if s not in val_singers]
+    
+    # Select the appropriate singers for this split
     if split_name == "train":
-        # Use 14 singers for training (70%)
-        male_ids = [1, 2, 3, 4, 5, 6, 7]
-        female_ids = [1, 2, 3, 4, 5, 6, 7]
+        target_singers = train_singers
     elif split_name == "val":
-        # Use 3 singers for validation (15%)
-        male_ids = [8, 9]
-        female_ids = [8]
+        target_singers = val_singers
     else:  # test
-        # Use 3 singers for testing (15%)
-        male_ids = [10]
-        female_ids = [9, 10]
+        target_singers = test_singers
     
-    # Create string patterns to match the correct singers
-    male_patterns = [f"male{id}_" for id in male_ids]
-    female_patterns = [f"female{id}_" for id in female_ids]
-    singer_patterns = male_patterns + female_patterns
+    logger.info(f"Using {len(target_singers)} singers for {split_name} split: {target_singers}")
     
-    # Find all WAV files that match the singers for this split
+    # Build patterns for matching filenames
+    all_patterns = []
+    for singer in target_singers:
+        # Add common pattern formats
+        all_patterns.extend([
+            f"{singer}_", 
+            f"{singer}/",
+            f"/{singer}/"
+        ])
+    
+    # Find all WAV files that match any of the patterns
     vocal_files = []
-    all_files = list(vocalset_dir.rglob("*.wav"))
-    
     for file in all_files:
-        file_str = str(file)
-        if any(pattern in file_str for pattern in singer_patterns):
+        file_str = str(file).lower()
+        if any(pattern in file_str for pattern in all_patterns):
             vocal_files.append(file)
     
-    logger.info(f"Found {len(vocal_files)} VocalSet audio files for {split_name} split")
+    # 4. If pattern matching failed, fallback to random splitting
+    if len(vocal_files) < 10:  # Very few files found with pattern matching
+        logger.warning(
+            f"Pattern matching found only {len(vocal_files)}/{len(all_files)} files. "
+            f"Falling back to random split to avoid data loss."
+        )
+        
+        # Deterministic shuffling
+        random.seed(42 + {"train": 0, "val": 1, "test": 2}[split_name])
+        shuffled_files = list(all_files)
+        random.shuffle(shuffled_files)
+        
+        # Split: 70% train, 15% val, 15% test
+        n_total = len(shuffled_files)
+        if split_name == "train":
+            vocal_files = shuffled_files[:int(0.7 * n_total)]
+        elif split_name == "val":
+            vocal_files = shuffled_files[int(0.7 * n_total):int(0.85 * n_total)]
+        else:  # test
+            vocal_files = shuffled_files[int(0.85 * n_total):]
+    
+    logger.info(f"Selected {len(vocal_files)} VocalSet audio files for {split_name} split")
     return vocal_files
-
 
 def process_esc50(
     root_dir: pathlib.Path, 
-    split_name: str = "train",  # Add split parameter
+    split_name: str = "train",
     sample_rate: int = 16000
 ) -> list[pathlib.Path]:
     """
-    Process ESC-50 dataset with proper train/val/test splitting.
+    Process ESC-50 dataset with proper train/val/test splitting based on the original folds.
+    Excludes all human-related sounds to avoid contaminating the negative samples with speech.
     
     Args:
         root_dir: Root directory where dataset is extracted
@@ -367,13 +418,7 @@ def process_esc50(
     all_files = list(audio_dir.glob("*.wav"))
     logger.info(f"Found {len(all_files)} ESC-50 audio files")
 
-    # Filter out human vocal sounds
-    exclude_prefixes = ["0", "5"]
-    
-    # Map split name to fold numbers:
-    # - train: folds 1, 2, 3 (60%)
-    # - val: fold 4 (20%) 
-    # - test: fold 5 (20%)
+    # Map split name to fold numbers (ESC-50 has 5 folds, numbered 1-5 in filenames)
     if split_name == "train":
         target_folds = ["1", "2", "3"]
     elif split_name == "val":
@@ -381,19 +426,52 @@ def process_esc50(
     else:  # test
         target_folds = ["5"]
     
-    # Filter files by both category and fold
+    # Define all human-related sound categories to exclude
+    human_categories = [
+        "20",  # crying_baby
+        "21",  # sneezing
+        "22",  # clapping
+        "23",  # breathing
+        "24",  # coughing
+        "25",  # footsteps
+        "26",  # laughing
+        "27",  # brushing_teeth
+        "28",  # snoring
+        "29",  # drinking_sipping
+    ]
+    
+    # Filter files by fold and exclude human sounds
     noise_files = []
+    excluded_human = 0
+    excluded_fold = 0
+    
     for file in all_files:
-        # ESC-50 filename format: {category}-{fold}-{ID}-{take}.wav
+        # ESC-50 filename format: {FOLD}-{CLIP_ID}-{TAKE}-{TARGET}.wav
         parts = file.stem.split("-")
-        category = parts[0]
-        fold = parts[1]
         
-        # Check both category (not human sounds) and correct fold for this split
-        if not any(category.startswith(prefix) for prefix in exclude_prefixes) and fold in target_folds:
-            noise_files.append(file)
+        if len(parts) < 4:
+            logger.warning(f"Unexpected filename format: {file.name}")
+            continue
+            
+        fold = parts[0]
+        target = parts[3]  # Category/class is in the 4th position (index 3)
+        
+        # First check if this file belongs to the right fold
+        if fold not in target_folds:
+            excluded_fold += 1
+            continue
+            
+        # Then check if this is a human-related sound
+        if target in human_categories:
+            excluded_human += 1
+            continue
+            
+        # If it passes both checks, include it
+        noise_files.append(file)
 
     logger.info(f"Selected {len(noise_files)} ESC-50 audio files for {split_name} split")
+    logger.info(f"Excluded {excluded_human} human-related sounds and {excluded_fold} files from other folds")
+    
     return noise_files
 
 
@@ -480,6 +558,69 @@ def create_overlapping_speech(
 
     return mix, vad_labels
 
+def process_musan(
+    root_dir: pathlib.Path,
+    split_name: str = "train",
+    sample_rate: int = 16000,
+) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
+    """
+    Process MUSAN dataset with train/val/test splitting.
+    
+    Args:
+        root_dir: Root directory where MUSAN is extracted
+        split_name: Which split to use ('train', 'val', or 'test')
+        sample_rate: Target sample rate
+        
+    Returns:
+        Tuple of (speech_files, noise_files) for the requested split
+    """
+    musan_root = root_dir / "musan"
+    
+    if not musan_root.exists():
+        logger.warning(f"MUSAN directory not found at {musan_root}")
+        return [], []
+    
+    # Load all files
+    all_speech_files = list(musan_root.joinpath("speech").rglob("*.wav"))
+    all_noise_files = list(musan_root.joinpath("noise").rglob("*.wav"))
+    
+    logger.info(f"Found {len(all_speech_files)} MUSAN speech files and {len(all_noise_files)} noise files")
+    
+    # Use deterministic shuffling for consistent splits
+    random.seed(42)  # Fixed seed for reproducibility
+    
+    # Shuffle both speech and noise files
+    shuffled_speech = all_speech_files.copy()
+    random.shuffle(shuffled_speech)
+    
+    shuffled_noise = all_noise_files.copy()
+    random.shuffle(shuffled_noise)
+    
+    # Split: 70% train, 15% val, 15% test
+    speech_train_idx = int(0.7 * len(shuffled_speech))
+    speech_val_idx = int(0.85 * len(shuffled_speech))
+    
+    noise_train_idx = int(0.7 * len(shuffled_noise))
+    noise_val_idx = int(0.85 * len(shuffled_noise))
+    
+    # Get the appropriate files based on split
+    if split_name == "train":
+        speech_files = shuffled_speech[:speech_train_idx]
+        noise_files = shuffled_noise[:noise_train_idx]
+        logger.info(f"Using {len(speech_files)}/{len(all_speech_files)} speech files and "
+                   f"{len(noise_files)}/{len(all_noise_files)} noise files for training")
+    elif split_name == "val":
+        speech_files = shuffled_speech[speech_train_idx:speech_val_idx]
+        noise_files = shuffled_noise[noise_train_idx:noise_val_idx]
+        logger.info(f"Using {len(speech_files)}/{len(all_speech_files)} speech files and "
+                   f"{len(noise_files)}/{len(all_noise_files)} noise files for validation")
+    else:  # test
+        speech_files = shuffled_speech[speech_val_idx:]
+        noise_files = shuffled_noise[noise_val_idx:]
+        logger.info(f"Using {len(speech_files)}/{len(all_speech_files)} speech files and "
+                   f"{len(noise_files)}/{len(all_noise_files)} noise files for testing")
+    
+    return speech_files, noise_files
 
 def create_mixed_negative_sample(
     noise_files,
@@ -1137,80 +1278,88 @@ def create_clean_speech_sample(
 
 def process_musdb(
     root_dir: pathlib.Path, 
-    split_name: str = "train",  # Your split name: "train", "val", or "test"
+    split_name: str = "train",
     sample_rate: int = 16000,
 ) -> list[pathlib.Path]:
     """
-    Process MUSDB HQ dataset, properly handling train/val/test splits.
-    Returns paths to all WAV files found in the dataset.
+    Process MUSDB HQ dataset, handling train/val/test splits from the actual directory structure.
+    Returns paths to all WAV files found in the dataset, excluding vocals and mixtures.
     """
-    musdb_root = root_dir / "MUSDB_HQ"
+    download_root = root_dir
+    musdb_root = root_dir / "musdb18hq"
     musdb_root.mkdir(exist_ok=True, parents=True)
     
     # Initialize the list to store file paths
     music_files = []
     
-    # Map our split names to MUSDB parameters
-    # For 'train': Use subset="train", split="train"
-    # For 'val': Use subset="train", split="validation"  
-    # For 'test': Use subset="test", split=None
-    if split_name == "train":
+    # Map our split names to MUSDB parameters - simpler mapping
+    # For train/val: Use subset="train" but split the files differently
+    # For test: Use subset="test"
+    if split_name in ["train", "val"]:
         musdb_subset = "train"
-        musdb_split = "train"
-    elif split_name == "val":
-        musdb_subset = "train"
-        musdb_split = "validation"
+        musdb_split = None  # Don't use MUSDB's internal split feature
     else:  # test
         musdb_subset = "test"
         musdb_split = None
     
-    logger.info(f"Loading MUSDB HQ data for {split_name} split (subset={musdb_subset}, split={musdb_split})")
+    logger.info(f"Loading MUSDB HQ data for {split_name} split (using subset={musdb_subset})")
     
     # Try to download MUSDB if not present
     try:
         # This will trigger download if needed
         _ = MUSDB_HQ(
-            root=musdb_root, 
+            root=download_root, 
             subset=musdb_subset, 
             download=True, 
-            sources=["bass", "drums", "other"],
+            sources=["bass", "drums", "other"],  # Exclude "vocals" here
             split=musdb_split
         )
     except Exception as e:
         logger.error(f"Error accessing MUSDB HQ dataset: {e}")
     
-    # MUSDB uses a specific directory structure, adapt our search to find the right files
-    if split_name == "train":
-        # For train split, look in train/train
-        search_dir = musdb_root / "train" / "train"
-    elif split_name == "val":
-        # For val split, look in train/validation
-        search_dir = musdb_root / "train" / "validation"
+    # MUSDB only has train and test folders, no nested structure
+    if split_name in ["train", "val"]:
+        search_dir = musdb_root / "train"
     else:
-        # For test split, look in test
         search_dir = musdb_root / "test"
     
-    # Ensure the directory exists
-    if not search_dir.exists():
-        logger.warning(f"MUSDB directory not found: {search_dir}")
-        # Fall back to direct subset directories
-        if split_name == "test":
-            search_dir = musdb_root / "test"
-        else:
-            search_dir = musdb_root / "train"
-    
-    # Find all WAV files in the search directory
+    # Find all WAV files in the search directory, excluding vocals and mixtures
+    all_wav_files = []
     if search_dir.exists():
-        # Recursively find all .wav files (for all tracks and sources)
-        wav_files = list(search_dir.rglob("*.wav"))
-        # Filter for mixture files if you only want mixtures
-        # wav_files = [f for f in wav_files if "mixture" in str(f)]
-        music_files.extend(wav_files)
-        logger.info(f"Found {len(wav_files)} WAV files in {search_dir}")
+        # Get all WAV files first
+        all_wav_files = list(search_dir.rglob("*.wav"))
+        
+        # Filter out any files containing "vocal" or "mixture" in their path (case-insensitive)
+        all_wav_files = [
+            f for f in all_wav_files 
+            if "vocal" not in str(f).lower() and "mixture" not in str(f).lower()
+        ]
+        
+        # Log the number of filtered files
+        logger.info(f"Found {len(all_wav_files)} suitable WAV files in {search_dir}")
+    
+    # For train/val, we need to split the files from the train folder
+    if split_name in ["train", "val"]:
+        # Use deterministic shuffling for consistent splits
+        random.seed(42)  # Fixed seed for reproducibility
+        random.shuffle(all_wav_files)
+        
+        # Split: 80% for train, 20% for validation
+        split_idx = int(0.8 * len(all_wav_files))
+        
+        if split_name == "train":
+            music_files = all_wav_files[:split_idx]
+            logger.info(f"Using {len(music_files)}/{len(all_wav_files)} files for training split")
+        else:  # val
+            music_files = all_wav_files[split_idx:]
+            logger.info(f"Using {len(music_files)}/{len(all_wav_files)} files for validation split")
+    else:
+        # For test, use all files from the test folder
+        music_files = all_wav_files
     
     # Create fallback if no files found
     if not music_files:
-        logger.warning(f"No MUSDB audio files found for {split_name} split. Creating fallback audio.")
+        logger.warning(f"No suitable MUSDB audio files found for {split_name} split. Creating fallback audio.")
         fallback_path = musdb_root / f"fallback_audio_{split_name}_{sample_rate//1000}k.wav"
         
         # Create silent audio
@@ -1218,7 +1367,7 @@ def process_musdb(
         sf.write(fallback_path, fallback_audio, sample_rate)
         music_files = [fallback_path]
     
-    logger.info(f"Using {len(music_files)} MUSDB audio files for {split_name} split")
+    logger.info(f"Using {len(music_files)} MUSDB audio files for {split_name} split (vocals and mixtures excluded)")
     return music_files
 
 def create_speech_music_sample_with_silero(
@@ -1395,8 +1544,11 @@ def make_pos_neg(
 
     # Get speech files from both LibriSpeech and MUSAN
     libri = sorted(libri_root.rglob("*.flac"))
-    musan_speech = list(musan_root.joinpath("speech").rglob("*.wav"))
-    musan_noise = list(musan_root.joinpath("noise").rglob("*.wav"))
+    musan_speech, musan_noise = process_musan(
+        musan_root.parent,  # The parent of musan_root (should be datasets/)
+        split_name=split_name,
+        sample_rate=sample_rate
+    )
     # With this:
     # Swap MUSAN music for MUSDB HQ mixtures
     musdb_music = process_musdb(
@@ -1413,11 +1565,11 @@ def make_pos_neg(
     if use_additional_datasets:
         # Process ESC-50 for noise sources
         root_dir = out_pos.parent.parent
-        esc50_noise = process_esc50(root_dir, sample_rate, split_name=split_name)
+        esc50_noise = process_esc50(root_dir=root_dir, split_name=split_name, sample_rate=sample_rate)
         logger.info(f"Added {len(esc50_noise)} ESC-50 noise files")
 
         # Process VocalSet for speech sources
-        vocalset_speech = process_vocalset(root_dir, sample_rate, split_name=split_name)
+        vocalset_speech = process_vocalset(root_dir=root_dir, split_name=split_name, sample_rate=sample_rate)
         logger.info(f"Added {len(vocalset_speech)} VocalSet speech files")
 
     # Combine noise sources
