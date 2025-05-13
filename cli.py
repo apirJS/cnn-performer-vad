@@ -25,13 +25,13 @@ def setup_prepare_parser(subparsers):
     # Base arguments
     parser.add_argument(
         "--root",
-        default=DEFAULT_ROOT_DIR,
         help="Root directory for all datasets and outputs",
+        default=DEFAULT_ROOT_DIR,
     )
     parser.add_argument(
         "--splits",
         nargs="+",
-        default=["train", "val"],
+        default=["train", "val", "test"],
         choices=["train", "val", "test"],
         help="Dataset splits to prepare (train, val, and/or test)",
     )
@@ -51,13 +51,13 @@ def setup_prepare_parser(subparsers):
         "--duration_range",
         type=float,
         nargs=2,
-        default=[5, 10],
+        default=[1, 12],
         help="Min and max duration in seconds for audio clips",
     )
     parser.add_argument(
         "--sample_rate",
         type=int,
-        default=DEFAULT_SAMPLE_RATE,
+        default=16000,
         help="Sample rate for audio processing",
     )
     parser.add_argument(
@@ -65,6 +65,67 @@ def setup_prepare_parser(subparsers):
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--use_full_dataset",
+        action="store_true",
+        help="Use the entire LibriSpeech dataset instead of sample sizes (only affects training set)",
+    )
+    parser.add_argument(
+        "--fleurs_langs",
+        default="id_id,yue_hant_hk,ka_ge,xh_za,yo_ng,ar_eg,hi_in,ta_in,vi_vn,mi_nz",
+        help=(
+            "Comma‑separated list of FLEURS language configs. "
+            "Valid options include: 'id_id', 'ja_jp', 'en_us', 'ar_eg', 'hi_in', etc. "
+            "Use 'all' for all 102 languages."
+        ),
+    )
+    parser.add_argument(
+        "--fleurs_streaming",
+        default=False,
+        action="store_true",
+        help="Stream FLEURS instead of downloading it (saves disk but no random access).",
+    )
+    parser.add_argument(
+        "--fraction_fleurs",
+        type=float,
+        default=0.50,
+        help="Fraction of positive samples from FLEURS",
+    )
+    parser.add_argument(
+        "--fraction_libri",
+        type=float,
+        default=0.30,
+        help="Fraction of positive samples from LibriSpeech",
+    )
+    parser.add_argument(
+        "--fraction_musan",
+        type=float,
+        default=0.20,
+        help="Fraction of positive samples from MUSAN speech",
+    )
+    parser.add_argument(
+        "--use_additional_datasets",
+        action="store_true",
+        help="Use ESC-50 (noise) and VocalSet (singing) datasets in addition to LibriSpeech and MUSAN",
+    )
+    parser.add_argument(
+        "--neg_noise_ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of negative samples that are pure noise",
+    )
+    parser.add_argument(
+        "--neg_esc50_ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of negative samples that are ESC-50 sounds",
+    )
+    parser.add_argument(
+        "--neg_music_ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of negative samples that are music",
     )
 
     return parser
@@ -260,7 +321,7 @@ def main():
     if args.command == "prepare":
         from prepare_data import main as prepare_main
 
-        prepare_main()
+        prepare_main(args)  # Pass the parsed arguments to prepare_main
     elif args.command == "train":
         from train import main as train_main
 

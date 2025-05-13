@@ -1,218 +1,325 @@
-#!/usr/bin/env python3
+"""inference.py
+────────────────────────────────────────────────────────────────────────────
+Frame‑ & clip‑level inference script for the VAD project.
+
+It is intended to be called from *cli.py* via the `inference` sub‑command:
+
+➜  python cli.py inference --input_files sample.wav --model_path vad_model.pt \
+       --output_dir results
+
+Key features
+------------
+* Accept TorchScript `.pt` **or** Lightning `.ckpt` models automatically.
+* Processes a single file or an entire directory.
+* Audios longer than 30 s are processed in 30 s chunks to keep memory usage stable.
+* Generates **frame‑level** probabilities ➜ aggregated to a **clip‑level** score.
+* Saves one CSV with all clip scores **and** optional per‑frame `.npy` dumps.
+* Saves a PNG visualisation for every clip: log‑Mel spectrogram with speech
+  regions highlighted.
+
+The public entry‑point is `main(args)` so that `cli.py` can forward the parsed
+`argparse.Namespace`. When run directly (`python inference.py ...`) we parse the
+same arguments for convenience.
+"""
+
+from __future__ import annotations
+
 import argparse
+import csv
+import json
+import logging
 import os
 import sys
+from pathlib import Path
+from typing import List, Tuple
+
 import numpy as np
 import torch
 import torchaudio
-from glob import glob
-from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve, auc
+import matplotlib.pyplot as plt
+import librosa.display as lbd
+from tqdm import tqdm
 
-from config import *
+from config import (
+    DEFAULT_SAMPLE_RATE,
+    DEFAULT_N_MELS,
+    DEFAULT_N_FFT,
+    DEFAULT_HOP_LENGTH,
+    DEFAULT_WIN_LENGTH,
+)
+from models import VADLightning  # Only needed when loading .ckpt
 
-# Ensure torchaudio transforms are initialized (MelSpectrogram, etc.)
-mel_transform = None
-db_transform = None
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
-def prepare_transforms(sample_rate, n_fft, hop_length, win_length, n_mels):
-    """Initialize mel and amplitude->dB transforms (global, to avoid re-init per file)."""
-    global mel_transform, db_transform
-    mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length, 
-        win_length=win_length, n_mels=n_mels, power=1.0
-    )
-    db_transform = torchaudio.transforms.AmplitudeToDB(top_db=80)
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+CHUNK_SECONDS = 30  # max chunk length
+FRAME_THRESHOLD = 0.5  # binary speech / non‑speech decision
 
-def load_model(checkpoint_path, device):
-    """Load the VAD model from checkpoint (Lightning) or TorchScript."""
-    model = None
-    if checkpoint_path.endswith(".pt") or checkpoint_path.endswith(".pth"):
-        # Assume a TorchScript saved model
-        model = torch.jit.load(checkpoint_path, map_location=device)
-        model.eval()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _load_model(model_path: Path, device: torch.device):
+    """Load TorchScript **or** Lightning checkpoint transparently."""
+    suffix = model_path.suffix.lower()
+    if suffix == ".pt":
+        logger.info(f"Loading TorchScript model from {model_path}")
+        model = torch.jit.load(model_path, map_location=device).eval()
+        is_scripted = True
+    elif suffix == ".ckpt":
+        logger.info(f"Loading Lightning checkpoint from {model_path}")
+        # Load with strict=False to allow architectural differences
+        lit_model = VADLightning.load_from_checkpoint(
+            model_path, map_location=device, strict=False  # Allow missing or extra keys
+        )
+        lit_model.eval()
+        model = lit_model
+        is_scripted = False
     else:
-        # Assume a PyTorch Lightning checkpoint
-        from models import VADLightning  # requires models.py in same directory
-        try:
-            model = VADLightning.load_from_checkpoint(checkpoint_path, map_location=device)
-        except Exception as e:
-            # Fallback: load state dict manually
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            hparams = checkpoint.get("hyper_parameters", {})
-            # Create a namespace for hyperparams
-            hp = argparse.Namespace(**hparams)
-            model = VADLightning(hp)
-            model.load_state_dict(checkpoint["state_dict"])
-        model.eval()
+        raise ValueError("Model must be a .pt or .ckpt file")
+
     model.to(device)
-    return model
+    return model, is_scripted
 
-def process_audio(file_path, device, sample_rate):
-    """Load an audio file and convert to mel spectrogram (on CPU), then to tensor on device."""
-    waveform, sr = torchaudio.load(file_path)
-    if waveform.shape[0] > 1:
-        # if stereo, convert to mono
-        waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+def _prepare_transforms(sample_rate: int, n_fft: int, hop: int, win: int, n_mels: int):
+    """Return (mel_transform, db_transform) configured for training parameters."""
+    mel = torchaudio.transforms.MelSpectrogram(
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        hop_length=hop,
+        win_length=win,
+        n_mels=n_mels,
+        power=1.0,
+    )
+    db = torchaudio.transforms.AmplitudeToDB(top_db=80)
+    return mel, db
+
+
+def _chunk_indices(num_samples: int, sample_rate: int) -> List[Tuple[int, int]]:
+    """Return (start, end) sample indices for ≤30 s chunks covering the audio."""
+    chunk_len = CHUNK_SECONDS * sample_rate
+    indices = [
+        (s, min(num_samples, s + chunk_len)) for s in range(0, num_samples, chunk_len)
+    ]
+    return indices
+
+
+def _run_model(mel_tensor: torch.Tensor, model, device: torch.device) -> np.ndarray:
+    """Run the model on a (T, n_mels) tensor and return frame probabilities."""
+    with torch.no_grad():
+        logits = model(mel_tensor.unsqueeze(0).to(device))  # (1,T)
+        probs = torch.sigmoid(logits).squeeze(0).cpu().numpy()  # (T,)
+    return probs
+
+
+def _visualise(
+    path: Path,
+    mel_db: np.ndarray,
+    frame_probs: np.ndarray,
+    out_file: Path,
+    sample_rate: int,
+    hop: int,
+):
+    """Save spectrogram visualisation with speech regions highlighted."""
+    times = np.arange(len(frame_probs)) * hop / sample_rate
+    speech_mask = frame_probs > FRAME_THRESHOLD
+
+    # Build contiguous speech segments for faster plotting
+    segments: List[Tuple[int, int]] = []
+    in_seg = False
+    seg_start = 0
+    for i, v in enumerate(speech_mask):
+        if v and not in_seg:
+            in_seg = True
+            seg_start = i
+        elif not v and in_seg:
+            segments.append((seg_start, i))
+            in_seg = False
+    if in_seg:
+        segments.append((seg_start, len(speech_mask)))
+
+    plt.figure(figsize=(12, 6))
+    ax = plt.gca()
+    img = lbd.specshow(
+        mel_db.T,
+        x_axis="time",
+        y_axis="mel",
+        sr=sample_rate,
+        hop_length=hop,
+        cmap="magma",
+        ax=ax,
+    )
+    plt.colorbar(img, ax=ax, format="%.0f dB")
+
+    # Overlay semi‑transparent rectangles for speech regions
+    for s, e in segments:
+        t0, t1 = times[s], times[e - 1]
+        ax.axvspan(t0, t1, color="lime", alpha=0.25)
+
+    ax.set_title(f"VAD prediction: {path.name}")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Mel‑bin")
+    plt.tight_layout()
+    plt.savefig(out_file, dpi=300)
+    plt.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core processing
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _process_audio(
+    audio_path: Path,
+    model,
+    device: torch.device,
+    mel_t,
+    db_t,
+    sample_rate: int,
+    n_fft: int,
+    hop: int,
+    win: int,
+    output_dir: Path,
+    save_frames: bool = True,
+):
+    """Return clip_score, frame_probs and save artefacts (npy & PNG)."""
+    wav, sr = torchaudio.load(audio_path)
     if sr != sample_rate:
-        waveform = torchaudio.functional.resample(waveform, sr, sample_rate)
-    # Clamp to avoid extreme values
-    waveform = waveform.clamp(-1.0, 1.0)
-    # Compute mel spectrogram
-    mel_spec = db_transform(mel_transform(waveform))
-    mel_spec = mel_spec.squeeze(0).T  # shape (T, n_mels)
-    # Move to device
-    mel_spec = mel_spec.to(device)
-    return mel_spec
+        wav = torchaudio.functional.resample(wav, sr, sample_rate)
+    wav = wav.mean(0, keepdim=True)  # mono
 
-def pad_batch(batch_tensors, max_frames=None):
-    """Pad a list of [T, n_mels] tensors to the same length (max_frames or longest in batch)."""
-    lengths = [t.shape[0] for t in batch_tensors]
-    max_len = max_frames if max_frames is not None else max(lengths)
-    max_len = min(max_len, max(lengths))
-    n_mels = batch_tensors[0].shape[1]
-    batch_size = len(batch_tensors)
-    padded = torch.zeros(batch_size, max_len, n_mels, device=batch_tensors[0].device)
-    mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=batch_tensors[0].device)
-    for i, t in enumerate(batch_tensors):
-        seq_len = min(t.shape[0], max_len)
-        padded[i, :seq_len, :] = t[:seq_len]
-        mask[i, :seq_len] = True
-    return padded, mask, lengths
+    # Move the audio tensor to the same device as the transforms
+    wav = wav.to(device)
 
-def main(args=None):
-    """Run VAD inference on audio files."""
-    if args is None:
-        # If called directly (not from CLI), parse arguments
-        parser = argparse.ArgumentParser(description="VAD Inference Script")
-        parser.add_argument("--input_dir", help="Directory of audio files to run VAD on")
-        parser.add_argument("--input_files", nargs='+', help="List of audio file paths to run VAD on")
-        parser.add_argument("--labels_dir", help="Directory containing frame label .npy files (optional)")
-        parser.add_argument("--model_path", required=True, help="Path to trained VAD model (checkpoint .ckpt or TorchScript .pt)")
-        parser.add_argument("--sample_rate", type=int, default=DEFAULT_SAMPLE_RATE, help="Audio sample rate expected by model")
-        parser.add_argument("--n_fft", type=int, default=DEFAULT_N_FFT, help="n_fft for mel spectrogram (must match training)")
-        parser.add_argument("--hop_length", type=int, default=DEFAULT_HOP_LENGTH, help="Hop length for mel spectrogram")
-        parser.add_argument("--win_length", type=int, default=DEFAULT_WIN_LENGTH, help="Window length for mel spectrogram")
-        parser.add_argument("--n_mels", type=int, default=DEFAULT_N_MELS, help="Number of mel bands")
-        parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size for processing audio")
-        parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device: cuda or cpu")
-        parser.add_argument("--output_dir", help="Directory to save prediction results (optional)")
-        args = parser.parse_args()
+    total_samples = wav.shape[1]
+    indices = _chunk_indices(total_samples, sample_rate)
 
-    # Collect audio file paths
-    file_list = []
-    if args.input_files:
-        file_list = args.input_files
-    elif args.input_dir:
-        file_list = sorted(glob(os.path.join(args.input_dir, "*.wav")))
-    else:
-        print("Please specify --input_dir or --input_files")
-        return 1
-    if len(file_list) == 0:
-        print("No audio files found to process.")
-        return 1
+    frame_probs_all = []
+    mel_db_all = []  # for visualisation
 
-    # Prepare transforms and model
-    prepare_transforms(args.sample_rate, args.n_fft, args.hop_length, args.win_length, args.n_mels)
+    for s, e in indices:
+        chunk = wav[:, s:e]
+        mel = db_t(mel_t(chunk)).squeeze(0).transpose(0, 1)  # (T,n_mels)
+        frame_probs = _run_model(mel, model, device)
+
+        frame_probs_all.append(frame_probs)
+        mel_db_all.append(mel.cpu().numpy())
+
+    frame_probs_cat = np.concatenate(frame_probs_all, axis=0)
+    mel_db_cat = np.concatenate(mel_db_all, axis=0)  # (T,n_mels)
+
+    clip_score = float(frame_probs_cat.mean())
+
+    # Save per‑frame probabilities for optional post‑analysis
+    if save_frames:
+        np.save(output_dir / f"{audio_path.stem}_frame_probs.npy", frame_probs_cat)
+
+    # Save visualisation
+    _visualise(
+        audio_path,
+        mel_db_cat,
+        frame_probs_cat,
+        output_dir / f"{audio_path.stem}_vad.png",
+        sample_rate,
+        hop,
+    )
+
+    return clip_score, frame_probs_cat
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def main(args: argparse.Namespace):
+    """Entry‑point expected by *cli.py* (`args` already parsed)."""
+    # Ensure output directory
+    out_dir = Path(args.output_dir or "inference_results")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Saving results to {out_dir}")
+
     device = torch.device(args.device)
-    model = load_model(args.model_path, device)
+    model, _ = _load_model(Path(args.model_path), device)
 
-    # If model is a Lightning module, get underlying net
-    # We assume if it's Lightning, it has .net attribute for actual nn.Module
-    vad_net = model.net if hasattr(model, "net") else model
+    mel_t, db_t = _prepare_transforms(
+        sample_rate=args.sample_rate,
+        n_fft=args.n_fft,
+        hop=args.hop_length,
+        win=args.win_length,
+        n_mels=args.n_mels,
+    )
+    mel_t.to(device)
+    db_t.to(device)
 
-    all_frame_preds = []
-    all_frame_labels = []
-    clip_preds = []
-    clip_labels = []
-
-    # Save predictions if output directory specified
-    if args.output_dir and not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
-
-    # Process in batches
-    for start in range(0, len(file_list), args.batch_size):
-        batch_files = file_list[start:start+args.batch_size]
-        # Load and transform each file in batch (on CPU), then move to device
-        mel_list = [process_audio(fp, device, args.sample_rate) for fp in batch_files]
-        # Pad batch
-        mel_batch, mask, lengths = pad_batch(mel_list)
-        # Run model
-        with torch.no_grad():
-            logits = vad_net(mel_batch)  # shape (B, T) logits
-            probs = torch.sigmoid(logits)  # probabilities
-        probs = probs.cpu().numpy()
-        mask = mask.cpu().numpy()
-
-        # Process each file in batch
-        for i, fp in enumerate(batch_files):
-            valid_len = mask[i].sum()  # number of true frames
-            frame_probs = probs[i, :valid_len]
-            all_frame_preds.append(frame_probs)
-            # Clip-level prediction = mean probability
-            clip_pred = float(frame_probs.mean())
-            clip_preds.append(clip_pred)
-            # Load frame labels if available
-            if args.labels_dir:
-                base = os.path.splitext(os.path.basename(fp))[0]
-                label_path = os.path.join(args.labels_dir, base + "_labels.npy")
-                if os.path.exists(label_path):
-                    frame_labels = np.load(label_path).astype(np.float32)
-                    frame_labels = frame_labels[:valid_len]  # truncate to match
-                    all_frame_labels.append(frame_labels)
-                    # Determine clip label (1 if any speech frame)
-                    clip_label = 1.0 if frame_labels.max() > 0.5 else 0.0
-                    clip_labels.append(clip_label)
-                else:
-                    # If no label file, skip metrics for this file
-                    all_frame_labels.append(None)
-                    clip_labels.append(None)
-            else:
-                all_frame_labels.append(None)
-                clip_labels.append(None)
-            
-            # Print or log per-file results
-            print(f"{fp}: clip_speech_confidence={clip_pred:.3f}")
-            
-            # Save prediction to output directory if specified
-            if args.output_dir:
-                base = os.path.splitext(os.path.basename(fp))[0]
-                pred_path = os.path.join(args.output_dir, f"{base}_pred.npy")
-                np.save(pred_path, frame_probs)
-
-    # Compute metrics if we have labels for all files
-    have_labels = args.labels_dir and all(x is not None for x in all_frame_labels)
-    if have_labels:
-        # Concatenate all frame-level predictions and labels
-        y_true = np.concatenate([lbls for lbls in all_frame_labels if lbls is not None])
-        y_pred = np.concatenate([pred for pred in all_frame_preds])
-        # Frame-level ROC AUC
-        frame_roc_auc = roc_auc_score(y_true, y_pred)
-        # Frame-level optimal F1
-        prec, rec, thr = precision_recall_curve(y_true, y_pred)
-        f1_scores = 2 * prec * rec / (prec + rec + 1e-8)
-        best_idx = np.nanargmax(f1_scores)
-        best_thr = thr[best_idx] if best_idx < len(thr) else 0.5
-        best_frame_f1 = f1_scores[best_idx] if best_idx < len(f1_scores) else 0.0
-        # At threshold 0.5 also compute F1 for reference
-        frame_f1_0_5 = f1_score(y_true, (y_pred >= 0.5).astype(int))
-        # Clip-level metrics
-        clip_labels_arr = np.array([c for c in clip_labels if c is not None])
-        clip_preds_arr = np.array([p for p, c in zip(clip_preds, clip_labels) if c is not None])
-        clip_roc_auc = roc_auc_score(clip_labels_arr, clip_preds_arr) if clip_labels_arr.size > 0 else None
-        clip_f1 = f1_score(clip_labels_arr, (clip_preds_arr >= 0.5).astype(int)) if clip_labels_arr.size > 0 else None
-
-        print("\nOverall metrics:")
-        print(f"Frame ROC AUC: {frame_roc_auc:.3f}")
-        print(f"Frame F1 (optimal threshold = {best_thr:.2f}): {best_frame_f1:.3f}")
-        print(f"Frame F1 (threshold=0.5): {frame_f1_0_5:.3f}")
-        if clip_roc_auc is not None:
-            print(f"Clip ROC AUC: {clip_roc_auc:.3f}")
-        if clip_f1 is not None:
-            print(f"Clip F1 (threshold=0.5): {clip_f1:.3f}")
+    # Resolve list of audio files
+    if args.input_dir:
+        audio_files = sorted(Path(args.input_dir).rglob("*.wav"))
     else:
-        print("\nInference complete. No ground truth labels provided, so metrics were not computed.")
-    
+        audio_files = [Path(p) for p in args.input_files]
+
+    if not audio_files:
+        logger.error("No audio files found for inference")
+        return 1
+
+    csv_path = out_dir / "predictions.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["path", "clip_score"])
+
+        for wav_path in tqdm(audio_files, desc="Inferencing"):
+            clip_score, _ = _process_audio(
+                wav_path,
+                model,
+                device,
+                mel_t,
+                db_t,
+                args.sample_rate,
+                args.n_fft,
+                args.hop_length,
+                args.win_length,
+                out_dir,
+            )
+            writer.writerow([wav_path, f"{clip_score:.6f}"])
+
+    logger.info("✅ Inference completed.")
+    logger.info(f"CSV saved at {csv_path}")
     return 0
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI when run directly
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    sys.exit(main())
+    p = argparse.ArgumentParser("VAD Inference")
+    # Re‑use the same arguments as defined in cli.py
+    input_grp = p.add_mutually_exclusive_group(required=True)
+    input_grp.add_argument("--input_dir")
+    input_grp.add_argument("--input_files", nargs="+")
+
+    p.add_argument("--model_path", required=True)
+    p.add_argument("--output_dir", default="inference_results")
+
+    p.add_argument("--sample_rate", type=int, default=DEFAULT_SAMPLE_RATE)
+    p.add_argument("--n_fft", type=int, default=DEFAULT_N_FFT)
+    p.add_argument("--hop_length", type=int, default=DEFAULT_HOP_LENGTH)
+    p.add_argument("--win_length", type=int, default=DEFAULT_WIN_LENGTH)
+    p.add_argument("--n_mels", type=int, default=DEFAULT_N_MELS)
+
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+
+    args_ = p.parse_args()
+    sys.exit(main(args_))

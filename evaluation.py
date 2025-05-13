@@ -87,7 +87,7 @@ def prepare_validation_test_split(args):
     # Prepare validation data for threshold tuning
     val_manifest = prepare_dataset(
         args.test_root,
-        split="validation",
+        split="val",
         n_pos=args.n_validation,
         n_neg=args.n_validation,
         duration_range=args.duration_range,

@@ -168,14 +168,20 @@ class VADLightning(pl.LightningModule):
     def __init__(self, hp):
         super().__init__()
         logger.info(f"Initializing frame-level VADLightning with hyperparameters: {hp}")
-        self.save_hyperparameters(hp)
-
-        # Use max_frames parameter from hyperparameters for positional encoding length
-        max_seq_len = getattr(
-            hp, "max_frames", 2000
-        )  # Default to 2000 if not specified
+        # Convert dictionary to object-like access if needed
+        if isinstance(hp, dict):
+            from types import SimpleNamespace
+            hp = SimpleNamespace(**hp)
+            
+        # Log hyperparameters
+        logger.info(f"Initializing frame-level VADLightning with hyperparameters: {hp.__dict__ if hasattr(hp, '__dict__') else hp}")
+        
+        # Store hyperparameters to enable checkpoint loading
+        self.save_hyperparameters(hp.__dict__ if hasattr(hp, '__dict__') else hp)
+        
+        # Create model
         self.net = MelPerformer(
-            hp.n_mels, hp.dim, hp.n_layers, hp.n_heads, max_seq_len=max_seq_len
+            hp.n_mels, hp.dim, hp.n_layers, hp.n_heads, max_seq_len=hp.max_frames
         )
 
         # Use the pos_weight parameter as the alpha value in FocalLoss

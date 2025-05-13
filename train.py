@@ -30,8 +30,13 @@ logger = logging.getLogger(__name__)
 
 def get_best_precision():
     """Determine the best precision format for the available hardware."""
-    logger.info("Using default 32-bit precision for stability")
-    return 32  # Default to 32-bit precision for stability
+    if not torch.cuda.is_available():
+        logger.info("CUDA not available, using 32-bit precision")
+        return 32
+    
+    precision = "bf16-mixed" if torch.cuda.is_bf16_supported() else "16-mixed"
+    logger.info(f"Using {precision} precision for training")
+    return precision
 
 
 def build_parser():

@@ -7,7 +7,7 @@ import json
 import logging
 import pathlib
 import random
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional
 
 import numpy as np
 import torch
@@ -262,12 +262,12 @@ def collate_pad(batch, max_frames=DEFAULT_MAX_FRAMES):
     # If all samples were filtered out, return a minimal dummy batch
     if len(filtered_batch) == 0:
         logger.error("All samples in batch were invalid!")
-        # Return minimal batch with clear indication it's invalid
-        # Using 1 frame and n_mels from original batch
+        # Return dummy batch with the original batch size and correct dimensions
+        batch_size = len(batch)
         n_mels = batch[0][0].shape[1] if batch else DEFAULT_N_MELS
-        dummy_x = torch.zeros(1, 1, n_mels)  # Batch size 1, 1 frame
-        dummy_y = torch.zeros(1, 1)
-        dummy_mask = torch.zeros(1, 1, dtype=torch.bool)
+        dummy_x = torch.zeros(batch_size, max_frames, n_mels)
+        dummy_y = torch.zeros(batch_size, max_frames)
+        dummy_mask = torch.zeros(batch_size, max_frames, dtype=torch.bool)
         return dummy_x, dummy_y, dummy_mask
     
     # Process the filtered batch
