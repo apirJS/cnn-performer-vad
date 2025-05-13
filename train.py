@@ -28,15 +28,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def get_best_precision():
-    """Determine the best precision format for the available hardware."""
+def get_best_precision(device: torch.device = None) -> str:
+    """Return one of 'fp32', 'fp16-mixed' or 'bf16-mixed'."""
     if not torch.cuda.is_available():
-        logger.info("CUDA not available, using 32-bit precision")
-        return 32
-    
-    precision = "bf16-mixed" if torch.cuda.is_bf16_supported() else "16-mixed"
-    logger.info(f"Using {precision} precision for training")
-    return precision
+        logger.info("CUDA not available → using fp32")
+        return "fp32"
+
+    device = device or torch.device("cuda")
+    props  = torch.cuda.get_device_properties(device)
+    cc_major = props.major
+
+    if torch.cuda.is_bf16_supported():
+        logger.info("Using bf16-mixed")
+        return "bf16-mixed"
+    elif cc_major >= 7:  # Turing (7.5) or later
+        logger.info("Using fp16-mixed")
+        return "fp16-mixed"
+    else:
+        logger.info("GPU has no Tensor-core acceleration → fp32")
+        return "fp32"
 
 
 def build_parser():
@@ -346,6 +356,7 @@ def setup_trainer(args, callbacks):
         gradient_clip_val=args.gradient_clip_val,
         strategy=strategy,
         logger=tb_logger,
+        precision=32 if precision == "fp32" else ("bf16" if precision == "bf16-mixed" else 16),
     )
     
     return trainer
