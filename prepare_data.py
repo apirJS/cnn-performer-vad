@@ -27,17 +27,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # URL constants
-TRAIN_LIBRISPEECH_URL = "https://www.openslr.org/resources/12/train-clean-360.tar.gz"
+TRAIN_LIBRISPEECH_URL = "https://www.openslr.org/resources/12/train-clean-100.tar.gz"
 VAL_LIBRISPEECH_URL = "https://www.openslr.org/resources/12/dev-clean.tar.gz"
 TEST_CLEAN_URL = "https://www.openslr.org/resources/12/test-clean.tar.gz"
 MUSAN_URL = "https://www.openslr.org/resources/17/musan.tar.gz"
 ESC_50_URL = "https://github.com/karoldvl/ESC-50/archive/master.zip"
 VOCALSET_URL = "https://zenodo.org/records/1193957/files/VocalSet.zip?download=1"
 MUSDB18HQ_URL = "https://zenodo.org/records/3338373/files/musdb18hq.zip?download=1"
+URBANSOUND8K = "https://goo.gl/8hY5ER"
 
-FRACTION_FLEURS = 0.50  # 50% of positives from FLEURS
-FRACTION_LIBRI = 0.30  # 30% of positives from LibriSpeech
-FRACTION_MUSAN = 0.20  # 20% of positives from MUSAN speech
 MAX_PER_LANG_TRAIN = 1000  # FLEURS gives ≈1000 train clips per language
 MAX_PER_LANG_VAL = 400  # idem for dev
 MAX_PER_LANG_TEST = 400
@@ -46,7 +44,134 @@ MAX_PER_LANG_TEST = 400
 # ───────────────────────────────────────────────────────────────────────
 # HELPER UTILITIES
 # ───────────────────────────────────────────────────────────────────────
+def download_and_extract_urbansound8k(url: str, dest: pathlib.Path):
+    """Download and extract the UrbanSound8K dataset if not already done."""
+    fname = dest / "urbansound8k.tar.gz"
+    if not fname.exists():
+        success = download_file(url, fname)
+        if not success:
+            logger.error(f"Failed to download UrbanSound8K dataset")
+            sys.exit(f"❌ Failed to download UrbanSound8K dataset")
+    else:
+        logger.info(f"UrbanSound8K archive already exists: {fname}, skipping download")
 
+    mark = dest / f".extracted_urbansound8k.tar.gz"
+    if not mark.exists():
+        logger.info(f"Extracting UrbanSound8K archive")
+        print(f"📦 Extracting urbansound8k.tar.gz")
+        import tarfile
+
+        try:
+            with tarfile.open(fname) as tar:
+                tar.extractall(path=dest)
+            mark.touch()
+            logger.info(f"UrbanSound8K extraction completed and marked with {mark}")
+        except Exception as e:
+            logger.error(f"Error extracting UrbanSound8K dataset: {e}")
+            sys.exit(f"❌ Error extracting UrbanSound8K dataset: {e}")
+    else:
+        logger.info(f"UrbanSound8K archive already extracted (marker file exists): {mark}")
+
+
+def process_urbansound8k(
+    root_dir: pathlib.Path, 
+    split_name: str = "train", 
+    sample_rate: int = 16000
+) -> list[pathlib.Path]:
+    """
+    Process UrbanSound8K dataset with train/val/test splitting based on folds.
+    Excludes human-related sounds to avoid contaminating negative samples with speech.
+
+    Args:
+        root_dir: Root directory where dataset is extracted
+        split_name: Which split to use ('train', 'val', or 'test')
+        sample_rate: Target sample rate
+
+    Returns:
+        List of paths to noise audio files for the requested split
+    """
+    # Find the UrbanSound8K directory
+    urbansound_dirs = list(root_dir.glob("*UrbanSound8K*"))
+    if not urbansound_dirs:
+        logger.warning(f"UrbanSound8K directory not found in {root_dir}")
+        return []
+
+    urbansound_dir = urbansound_dirs[0]
+    logger.info(f"Found UrbanSound8K directory at {urbansound_dir}")
+
+    # Find audio directory
+    audio_dir = urbansound_dir / "audio"
+    if not audio_dir.exists():
+        audio_dirs = list(urbansound_dir.rglob("audio"))
+        if audio_dirs:
+            audio_dir = audio_dirs[0]
+            logger.info(f"Found UrbanSound8K audio directory at {audio_dir}")
+        else:
+            logger.warning(f"UrbanSound8K audio directory not found at {urbansound_dir}")
+            return []
+
+    # Load metadata file for class information
+    metadata_path = urbansound_dir / "metadata" / "UrbanSound8K.csv"
+    if not metadata_path.exists():
+        metadata_paths = list(urbansound_dir.rglob("*UrbanSound8K.csv"))
+        if metadata_paths:
+            metadata_path = metadata_paths[0]
+        else:
+            logger.warning(f"UrbanSound8K metadata file not found")
+            return []
+
+    # Read metadata to identify human-related sounds
+    try:
+        import pandas as pd
+        metadata = pd.read_csv(metadata_path)
+        
+        # Define human-related classes to exclude (children_playing)
+        human_class_ids = [2]  # class ID for "children_playing"
+        
+        # Map split name to fold numbers (10 folds total)
+        if split_name == "train":
+            target_folds = [1, 2, 3, 4, 5, 6]  # 60% for training
+        elif split_name == "val":
+            target_folds = [7, 8]  # 20% for validation
+        else:  # test
+            target_folds = [9, 10]  # 20% for testing
+            
+        # Filter metadata to get files for this split
+        split_files = metadata[
+            (metadata['fold'].isin(target_folds)) & 
+            (~metadata['class_id'].isin(human_class_ids))
+        ]
+        
+        # Build full paths to audio files
+        noise_files = []
+        excluded_human = 0
+        excluded_fold = 0
+        
+        # Process each file in the metadata
+        for _, row in split_files.iterrows():
+            fold = row['fold']
+            file_name = row['slice_file_name']
+            
+            # Full path to the audio file
+            file_path = audio_dir / f"fold{fold}" / file_name
+            
+            if file_path.exists():
+                noise_files.append(file_path)
+            else:
+                logger.warning(f"Audio file not found: {file_path}")
+                
+        # Count excluded files for logging
+        excluded_human = len(metadata[metadata['class_id'].isin(human_class_ids)])
+        excluded_fold = len(metadata[~metadata['fold'].isin(target_folds)])
+        
+        logger.info(f"Selected {len(noise_files)} UrbanSound8K audio files for {split_name} split")
+        logger.info(f"Excluded {excluded_human} human-related sounds and {excluded_fold} files from other folds")
+        
+        return noise_files
+        
+    except Exception as e:
+        logger.error(f"Error processing UrbanSound8K metadata: {e}")
+        return []
 
 def initialize_silero_vad(
     model_path: Optional[str] = None, force_reload: bool = False, device: str = None
@@ -132,12 +257,18 @@ def generate_silero_vad_labels(
     """
     Generate frame-level VAD labels using Silero VAD.
     """
+    # Get model device
+    device = next(model.parameters()).device
+    
     # Convert audio to tensor and ensure correct format
     if not torch.is_tensor(audio):
         audio_tensor = torch.FloatTensor(audio)
     else:
         audio_tensor = audio
 
+    # Move tensor to the same device as the model
+    audio_tensor = audio_tensor.to(device)
+    
     # Normalize if needed
     if torch.abs(audio_tensor).max() > 1.0:
         audio_tensor = audio_tensor / torch.abs(audio_tensor).max()
@@ -163,9 +294,9 @@ def generate_silero_vad_labels(
             force_reload=False,
             onnx=False,
             verbose=False,
-            trust_repo=True,
+            trust_repo=True
         )
-
+        
         # Now use the loaded utils
         speech_timestamps = utils["get_speech_timestamps"](
             audio_tensor,
@@ -1247,26 +1378,30 @@ def add_reverb(audio, sr, wet_level=None):
 def apply_eq(audio, sr):
     """
     Apply random equalization to simulate different microphones or channels.
-
-    Args:
-        audio: Input audio signal
-        sr: Sample rate
-
-    Returns:
-        Equalized audio
     """
     # Original audio
     eq_audio = audio.copy()
 
     # Apply 2-3 random frequency adjustments
     for _ in range(random.randint(2, 3)):
-        # Random center frequency
-        center_freq = random.uniform(100, 7000)
+        # Calculate Nyquist frequency
+        nyquist = sr / 2
+        
+        # Random center frequency (ensuring it's below Nyquist)
+        max_freq = min(7000, nyquist * 0.95)  # Cap at 7kHz or 95% of Nyquist
+        center_freq = random.uniform(100, max_freq)
+        
+        # Normalize frequency to range (0, 1)
+        w0 = center_freq / nyquist
+        
+        # Safety check to ensure w0 is strictly between 0 and 1
+        w0 = max(0.001, min(0.999, w0))
+        
         q = random.uniform(0.5, 5.0)
         gain_db = random.uniform(-10, 10)  # dB
 
         # Create and apply peaking filter
-        b, a = signal.iirpeak(center_freq / (sr / 2), q, gain_db)
+        b, a = signal.iirpeak(w0, q, gain_db)
         eq_audio = signal.lfilter(b, a, eq_audio)
 
     # Normalize output to prevent level blow-up
@@ -1448,27 +1583,45 @@ def process_musdb(
     root_dir: pathlib.Path,
     split_name: str = "train",
     sample_rate: int = 16000,
-    cleanup_stems: bool = True,  # Add a parameter to control cleanup
+    cleanup_stems: bool = True,
+    augment: bool = True,
+    segments_per_track: int = 8,         # Extract multiple segments per track
+    segment_length: int = 10,            # 10-second segments
+    augmentations_per_segment: int = 5,  # Generate 5 augmented versions per segment
 ) -> list[pathlib.Path]:
     """
-    Process MUSDB18HQ dataset and combine bass, drums, and other tracks into a single instrumental WAV file.
+    Process MUSDB18HQ dataset with extensive augmentation to increase dataset diversity.
+    Includes segment extraction, time/pitch shifting, EQ filtering, and more to
+    maximize diversity from limited music tracks.
 
     Args:
         root_dir: Root directory where dataset should be stored
         split_name: Which split to use ('train', 'val', or 'test')
         sample_rate: Target sample rate
         cleanup_stems: Whether to delete original stems after combining (saves disk space)
+        augment: Whether to apply augmentations (only for training set)
+        segments_per_track: Number of segments to extract from each track
+        segment_length: Duration in seconds for each segment
+        augmentations_per_segment: Number of augmented versions to create per segment
 
     Returns:
-        List of paths to combined instrumental audio files
+        List of paths to instrumental audio files (original and augmented)
     """
     # Create musdb18hq directory if it doesn't exist
     musdb_root = root_dir / "musdb18hq"
     musdb_root.mkdir(parents=True, exist_ok=True)
     
-    # Create a directory to store processing markers
+    # Create directories to store processing markers and augmented files
     markers_dir = musdb_root / ".markers"
     markers_dir.mkdir(exist_ok=True, parents=True)
+    
+    # Directories for segments and augmentations
+    segments_dir = musdb_root / "segments"
+    augmented_dir = musdb_root / "augmented"
+    
+    if split_name == "train" and augment:
+        segments_dir.mkdir(exist_ok=True, parents=True)
+        augmented_dir.mkdir(exist_ok=True, parents=True)
 
     # First, download and extract the dataset if needed
     try:
@@ -1502,7 +1655,7 @@ def process_musdb(
         bass_path = song_dir / "bass.wav"
         drums_path = song_dir / "drums.wav"
         other_path = song_dir / "other.wav"
-        vocals_path = song_dir / "vocals.wav"  # Also track vocals for potential deletion
+        vocals_path = song_dir / "vocals.wav"
 
         # Define output file path - maintain existing directory structure
         output_path = song_dir / "instrumental.wav"
@@ -1599,24 +1752,276 @@ def process_musdb(
         else:  # val
             music_files = music_files[split_idx:]
 
-        logger.info(f"Using {len(music_files)} files for {split_name}")
+        logger.info(f"Using {len(music_files)} original files for {split_name}")
+    
+    # ───────────────────────────────────────────────────────────────────────
+    # SEGMENT EXTRACTION - Break long tracks into multiple segments
+    # ───────────────────────────────────────────────────────────────────────
+    segmented_files = []
+    if split_name == "train" and augment and music_files:
+        logger.info(f"Extracting {segments_per_track} segments from each of {len(music_files)} music files")
+        
+        for track_idx, track_path in enumerate(tqdm(music_files, desc="Extracting segments")):
+            try:
+                # Check if we've already processed this track
+                segment_marker = markers_dir / f"{track_path.stem}_segments.marker"
+                segment_files = list(segments_dir.glob(f"{track_path.stem}_seg*.wav"))
+                
+                if segment_marker.exists() and segment_files:
+                    logger.info(f"Found {len(segment_files)} existing segments for {track_path.stem}")
+                    segmented_files.extend(segment_files)
+                    continue
+                    
+                # Load the full track
+                audio, _ = librosa.load(track_path, sr=sample_rate)
+                
+                # Only proceed if the file is long enough
+                min_duration = segment_length * sample_rate
+                if len(audio) < min_duration:
+                    logger.warning(f"Track {track_path.stem} too short for segmentation, skipping")
+                    continue
+                
+                # Calculate how many complete segments we can extract
+                total_segments = min(
+                    segments_per_track,
+                    (len(audio) // (segment_length * sample_rate))
+                )
+                
+                # If we can extract at least one segment
+                if total_segments > 0:
+                    for seg_idx in range(total_segments):
+                        # Determine segment boundaries with some overlap
+                        if total_segments > 1:
+                            # Distribute segments evenly across the track
+                            start = seg_idx * (len(audio) - segment_length * sample_rate) // max(1, total_segments - 1)
+                        else:
+                            # Just take the beginning if we only have one segment
+                            start = 0
+                            
+                        end = start + segment_length * sample_rate
+                        
+                        # Extract segment
+                        segment = audio[start:end]
+                        
+                        # Save segment
+                        segment_path = segments_dir / f"{track_path.stem}_seg{seg_idx}.wav"
+                        sf.write(segment_path, segment, sample_rate)
+                        segmented_files.append(segment_path)
+                
+                # Create marker to indicate this track has been segmented
+                segment_marker.touch()
+                
+            except Exception as e:
+                logger.error(f"Error creating segments from {track_path}: {e}")
+        
+        logger.info(f"Created {len(segmented_files)} segments from {len(music_files)} tracks")
+        
+    # ───────────────────────────────────────────────────────────────────────
+    # AUGMENTATION - Apply various transformations to increase diversity
+    # ───────────────────────────────────────────────────────────────────────
+    augmented_files = []
+    
+    # Only augment for training
+    if split_name == "train" and augment and (segmented_files or music_files):
+        # Determine which files to augment (segmented if available, otherwise originals)
+        source_files = segmented_files if segmented_files else music_files
+        logger.info(f"Creating {augmentations_per_segment} augmentations for each of {len(source_files)} music files")
+        
+        for i, source_path in enumerate(tqdm(source_files, desc="Augmenting music files")):
+            # Check if we've already augmented this file
+            aug_marker = markers_dir / f"{source_path.stem}_augmented.marker"
+            aug_files = list(augmented_dir.glob(f"{source_path.stem}_aug*.wav"))
+            
+            if aug_marker.exists() and len(aug_files) >= augmentations_per_segment:
+                logger.info(f"Found {len(aug_files)} existing augmentations for {source_path.stem}")
+                augmented_files.extend(aug_files)
+                continue
+                
+            try:
+                # Load the original audio
+                audio, _ = librosa.load(source_path, sr=sample_rate)
+                
+                for aug_idx in range(augmentations_per_segment):
+                    # Create a unique name for this augmentation
+                    aug_name = f"{source_path.stem}_aug{aug_idx}.wav"
+                    aug_path = augmented_dir / aug_name
+                    
+                    # Skip if already created
+                    if aug_path.exists():
+                        augmented_files.append(aug_path)
+                        continue
+                    
+                    # Start with the original audio
+                    augmented = audio.copy()
+                    
+                    # Apply a random selection of augmentations
+                    
+                    # 1. Time Stretching (90% chance for diversity)
+                    if random.random() < 0.9:
+                        stretch_factor = random.uniform(0.85, 1.15)
+                        augmented = librosa.effects.time_stretch(augmented, rate=stretch_factor)
+                    
+                    # 2. Pitch Shifting (80% chance)
+                    if random.random() < 0.8:
+                        pitch_steps = random.uniform(-2, 2)
+                        augmented = librosa.effects.pitch_shift(
+                            augmented, sr=sample_rate, n_steps=pitch_steps
+                        )
+                    
+                    # 3. Volume Scaling (90% chance)
+                    if random.random() < 0.9:
+                        volume_factor = random.uniform(0.6, 1.4)
+                        augmented = augmented * volume_factor
+                    
+                    # 4. Low-level noise addition (50% chance)
+                    if random.random() < 0.5:
+                        noise = np.random.randn(len(augmented))
+                        noise_level = random.uniform(0.001, 0.01)
+                        augmented = augmented + noise * noise_level
+                    
+                    # 5. Reverb (60% chance)
+                    if random.random() < 0.6:
+                        wet_level = random.uniform(0.1, 0.5)
+                        augmented = add_reverb(augmented, sample_rate, wet_level)
+                    
+                    # 6. EQ Filtering (70% chance) - use existing apply_eq function
+                    if random.random() < 0.7:
+                        augmented = apply_eq(augmented, sample_rate)
+                    
+                    # 7. Random silence insertion (30% chance)
+                    if random.random() < 0.3 and len(augmented) > sample_rate * 3:
+                        silence_duration = random.uniform(0.05, 0.3)  # 50-300ms
+                        silence_samples = int(silence_duration * sample_rate)
+                        silence_pos = random.randint(0, len(augmented) - silence_samples)
+                        augmented[silence_pos:silence_pos + silence_samples] = 0
+                    
+                    # 8. Shuffling chunks (15% chance - experimental)
+                    if random.random() < 0.15 and len(augmented) > sample_rate * 5:
+                        # Only for longer segments
+                        chunk_size = int(sample_rate * random.uniform(0.5, 1.0))
+                        if chunk_size < len(augmented) / 4:  # Ensure we have enough chunks
+                            # Split into chunks
+                            chunks = [augmented[i:i+chunk_size] for i in range(0, len(augmented), chunk_size)]
+                            # Shuffle some consecutive chunks
+                            shuffle_start = random.randint(0, len(chunks) - 3)
+                            shuffle_end = min(shuffle_start + random.randint(2, 4), len(chunks))
+                            random.shuffle(chunks[shuffle_start:shuffle_end])
+                            # Recombine
+                            augmented = np.concatenate(chunks)
+                    
+                    # Ensure consistent length
+                    augmented = librosa.util.fix_length(augmented, size=len(audio))
+                    
+                    # Normalize to prevent clipping
+                    augmented = augmented / (np.max(np.abs(augmented)) + 1e-7)
+                    
+                    # Save the augmented sample
+                    sf.write(aug_path, augmented, sample_rate)
+                    augmented_files.append(aug_path)
+                
+                # Mark that we've augmented this file
+                aug_marker.touch()
+                    
+            except Exception as e:
+                logger.error(f"Error augmenting {source_path.name}: {e}")
+        
+        logger.info(f"Created {len(augmented_files)} augmented music files")
+    
+    # ───────────────────────────────────────────────────────────────────────
+    # MUSIC MIXTURES - Create combinations of different tracks
+    # ───────────────────────────────────────────────────────────────────────
+    mixed_files = []
+    
+    if split_name == "train" and augment and len(source_files) >= 2:
+        # Only try to create mixes if we have at least 2 source files
+        n_combinations = min(30, len(source_files) * 2)  # Limit number of combinations
+        logger.info(f"Creating {n_combinations} mixed music combinations")
+        
+        # Check for existing mixtures
+        mix_marker = markers_dir / f"music_mixes_{split_name}.marker"
+        existing_mixes = list(augmented_dir.glob("mix_*.wav"))
+        
+        if mix_marker.exists() and existing_mixes:
+            logger.info(f"Found {len(existing_mixes)} existing music mixtures")
+            mixed_files.extend(existing_mixes)
+        else:
+            for mix_idx in range(n_combinations):
+                try:
+                    # Select two random source files
+                    track1, track2 = random.sample(source_files, 2)
+                    
+                    # Create a unique name for this mixture
+                    mix_name = f"mix_{track1.stem}_{track2.stem}_{mix_idx}.wav"
+                    mix_path = augmented_dir / mix_name
+                    
+                    # Skip if already created
+                    if mix_path.exists():
+                        mixed_files.append(mix_path)
+                        continue
+                    
+                    # Load audio
+                    audio1, _ = librosa.load(track1, sr=sample_rate)
+                    audio2, _ = librosa.load(track2, sr=sample_rate)
+                    
+                    # Ensure same length
+                    min_len = min(len(audio1), len(audio2))
+                    audio1 = audio1[:min_len]
+                    audio2 = audio2[:min_len]
+                    
+                    # Apply random processing to one track sometimes
+                    if random.random() < 0.5:
+                        # Apply EQ to second track
+                        audio2 = apply_eq(audio2, sample_rate)
+                    
+                    # Mix with random ratio
+                    mix_ratio = random.uniform(0.4, 0.6)
+                    mixed = audio1 * mix_ratio + audio2 * (1 - mix_ratio)
+                    
+                    # Normalize
+                    mixed = mixed / (np.max(np.abs(mixed)) + 1e-7)
+                    
+                    # Save mixed track
+                    sf.write(mix_path, mixed, sample_rate)
+                    mixed_files.append(mix_path)
+                    
+                except Exception as e:
+                    logger.error(f"Error creating music mixture {mix_idx}: {e}")
+            
+            # Mark mixtures as created
+            mix_marker.touch()
+            logger.info(f"Created {len(mixed_files)} mixed music files")
+    
+    # ───────────────────────────────────────────────────────────────────────
+    # COMBINE ALL MUSIC FILES
+    # ───────────────────────────────────────────────────────────────────────
+    all_music = []
+    all_music.extend(music_files)  # Original full tracks
+    
+    # For training, add all augmentations
+    if split_name == "train" and augment:
+        all_music.extend(segmented_files)   # Segments
+        all_music.extend(augmented_files)   # Augmented versions
+        all_music.extend(mixed_files)       # Mixed combinations
+    
+    logger.info(f"Final music dataset: {len(all_music)} files")
+    logger.info(f"  - Original tracks: {len(music_files)}")
+    if split_name == "train" and augment:
+        logger.info(f"  - Segments: {len(segmented_files)}")
+        logger.info(f"  - Augmented: {len(augmented_files)}")
+        logger.info(f"  - Mixes: {len(mixed_files)}")
 
     # Create fallback if no files found
-    if not music_files:
-        logger.warning(
-            f"No suitable MUSDB18HQ audio files found. Creating fallback audio."
-        )
-        fallback_path = (
-            musdb_root / f"fallback_audio_{split_name}_{sample_rate//1000}k.wav"
-        )
+    if not all_music:
+        logger.warning(f"No suitable MUSDB18HQ audio files found. Creating fallback audio.")
+        fallback_path = musdb_root / f"fallback_audio_{split_name}_{sample_rate//1000}k.wav"
 
         # Create silent audio
         fallback_audio = np.zeros(sample_rate * 10)  # 10 seconds of silence
         sf.write(fallback_path, fallback_audio, sample_rate)
-        music_files = [fallback_path]
+        all_music = [fallback_path]
         logger.info(f"Created fallback audio file at {fallback_path}")
 
-    return music_files
+    return all_music
 
 
 def create_speech_music_sample_with_silero(
@@ -1871,6 +2276,36 @@ def create_speech_noise_music_sample(
 
     return mix, vad_labels
 
+def stratified_librispeech_sample(libri_files, n_samples=10000):
+    """Sample LibriSpeech files with stratification by speaker."""
+    speakers = {}
+    for libri in libri_files:
+        # Extract speaker ID from path structure
+        speaker = str(libri.parent.parent.name)
+        if speaker not in speakers:
+            speakers[speaker] = []
+        speakers[speaker].append(libri)
+    
+    # Calculate per-speaker quota
+    n_speakers = len(speakers)
+    per_speaker = max(1, n_samples // n_speakers)
+    
+    # Take samples from each speaker
+    stratified_files = []
+    for speaker_files in speakers.values():
+        # Take up to per_speaker files from each speaker
+        n_to_take = min(per_speaker, len(speaker_files))
+        random.shuffle(speaker_files)  # Shuffle first
+        stratified_files.extend(speaker_files[:n_to_take])
+    
+    # If we need more samples, take randomly from remaining files
+    if len(stratified_files) < n_samples:
+        remaining = [f for f in libri_files if f not in stratified_files]
+        random.shuffle(remaining)
+        stratified_files.extend(remaining[:n_samples-len(stratified_files)])
+    
+    # If we have too many, trim
+    return stratified_files[:n_samples]
 
 def make_pos_neg(
     libri_root: pathlib.Path,
@@ -1883,16 +2318,15 @@ def make_pos_neg(
     duration_range=(2, 15),
     sample_rate=16000,
     split_name="train",
-    use_full_dataset=False,
     fleurs_langs=None,
     fleurs_streaming=False,
     speech_dir=None,
-    use_additional_datasets=True,  # Add this parameter
-    neg_noise_ratio=0.30,
+    neg_noise_ratio=0.20,
     neg_esc50_ratio=0.20,
-    neg_music_ratio=0.25,
+    neg_music_ratio=0.20,
     neg_noise_noise_ratio=0.10,
     neg_music_music_ratio=0.10,
+    neg_urbansound_ratio=0.20,
     vad_model=None,
 ):
     """
@@ -1939,6 +2373,13 @@ def make_pos_neg(
 
     # Get speech files from both LibriSpeech and MUSAN
     libri = sorted(libri_root.rglob("*.flac"))
+    logger.info(f"Found {len(libri)} LibriSpeech files, using random subset of 10,000")
+
+    # Use deterministic shuffling
+    random.seed(42)  # Keep consistent seed
+    libri = stratified_librispeech_sample(libri, n_samples=10000)
+    logger.info(f"Applied stratified sampling across {len(libri)} LibriSpeech files")
+
     musan_speech, musan_noise = process_musan(
         musan_root.parent,  # The parent of musan_root (should be datasets/)
         split_name=split_name,
@@ -1950,6 +2391,11 @@ def make_pos_neg(
         out_pos.parent.parent.parent,  # reuse same root
         split_name=split_name,
         sample_rate=sample_rate,
+        cleanup_stems=True,                # Save disk space by removing stems
+        augment=split_name=="train",       # Only augment training data
+        segments_per_track=8,              # Extract 8 segments per track
+        segment_length=10,                 # 10-second segments
+        augmentations_per_segment=5,       # Create 5 variants per segment
     )
     logger.info(f"Added {len(musdb_music)} MUSDB HQ mixture files as music sources")
 
@@ -1957,22 +2403,30 @@ def make_pos_neg(
     esc50_noise = []
     vocalset_speech = []
 
-    if use_additional_datasets:
-        # Process ESC-50 for noise sources
-        root_dir = out_pos.parent.parent
-        esc50_noise = process_esc50(
-            root_dir=root_dir.parent, split_name=split_name, sample_rate=sample_rate
-        )
-        logger.info(f"Added {len(esc50_noise)} ESC-50 noise files")
+    # Process ESC-50 for noise sources
+    root_dir = out_pos.parent.parent
+    esc50_noise = process_esc50(
+        root_dir=root_dir.parent, split_name=split_name, sample_rate=sample_rate
+    )
+    logger.info(f"Added {len(esc50_noise)} ESC-50 noise files")
 
-        # Process VocalSet for speech sources
-        vocalset_speech = process_vocalset(
-            root_dir=root_dir, split_name=split_name, sample_rate=sample_rate
-        )
-        logger.info(f"Added {len(vocalset_speech)} VocalSet speech files")
+    # Process VocalSet for speech sources
+    vocalset_speech = process_vocalset(
+        root_dir=root_dir, split_name=split_name, sample_rate=sample_rate
+    )
+    logger.info(f"Added {len(vocalset_speech)} VocalSet speech files")
+
+    urbansound_noise = []
+    # Process UrbanSound8K for noise sources
+    urbansound_noise = process_urbansound8k(
+        root_dir=root_dir.parent, 
+        split_name=split_name, 
+        sample_rate=sample_rate
+    )
+    logger.info(f"Added {len(urbansound_noise)} UrbanSound8K noise files")
 
     # Combine noise sources
-    all_noise_files = musan_noise + esc50_noise
+    all_noise_files = musan_noise + esc50_noise + urbansound_noise
     logger.info(f"Total noise files: {len(all_noise_files)}")
 
     # Add FLEURS data if provided
@@ -2024,44 +2478,43 @@ def make_pos_neg(
     )
 
     # ── BALANCED SAMPLING ─────────────────────────────────────────────
-    if use_full_dataset:
-        logger.info("Using full dataset mode - will use all available speech files")
-        # Use all available files
-        selected_fleurs = fleurs_speech
-        selected_libri = libri
-        selected_musan = musan_speech
-        selected_vocalset = vocalset_speech
-    else:
-        # Define the maximum possible positives based on available files
-        actual_n_pos = min(
-            n_pos,
-            len(libri) + len(fleurs_speech) + len(musan_speech) + len(vocalset_speech),
-        )
+    # Define the maximum possible positives based on available files
+    actual_n_pos = min(
+        n_pos,
+        len(libri) + len(fleurs_speech) + len(musan_speech) + len(vocalset_speech),
+    )
 
-        # ------------------------------------------------------------------
-        # Determine per-source quotas so they sum exactly to n_pos
-        # ------------------------------------------------------------------
-        source_weights = {
-            "libri": 1.0,
-            "fleurs": 1.0,
-            "musan": 1.0,
-            "vocalset": 1.0 if vocalset_speech else 0.0,
-        }
-        w_sum = sum(source_weights.values())
-        q_libri = int(round(actual_n_pos * source_weights["libri"] / w_sum))
-        q_fleurs = int(round(actual_n_pos * source_weights["fleurs"] / w_sum))
-        q_musan = int(round(actual_n_pos * source_weights["musan"] / w_sum))
-        q_vocalset = actual_n_pos - q_libri - q_fleurs - q_musan  # remainder guard
+    # ------------------------------------------------------------------
+    # Determine per-source quotas so they sum exactly to n_pos
+    # ------------------------------------------------------------------
+    source_weights = {
+        "libri": 1.0,
+        "fleurs": 1.0,
+        "musan": 1.0,
+        "vocalset": 1.0 if vocalset_speech else 0.0,
+    }
+    w_sum = sum(source_weights.values())
+    q_libri = int(round(actual_n_pos * source_weights["libri"] / w_sum))
+    q_fleurs = int(round(actual_n_pos * source_weights["fleurs"] / w_sum))
+    q_musan = int(round(actual_n_pos * source_weights["musan"] / w_sum))
+    q_vocalset = actual_n_pos - q_libri - q_fleurs - q_musan  # remainder guard
 
-        # Sample from each source based on quotas
-        selected_libri = random.sample(libri, min(q_libri, len(libri)))
-        selected_fleurs = random.sample(
-            fleurs_speech, min(q_fleurs, len(fleurs_speech))
-        )
-        selected_musan = random.sample(musan_speech, min(q_musan, len(musan_speech)))
-        selected_vocalset = random.sample(
-            vocalset_speech, min(q_vocalset, len(vocalset_speech))
-        )
+    # Shuffle each source before sampling
+    libri_shuffled = libri.copy()
+    fleurs_shuffled = fleurs_speech.copy()
+    musan_shuffled = musan_speech.copy()
+    vocalset_shuffled = vocalset_speech.copy()
+    
+    random.shuffle(libri_shuffled)
+    random.shuffle(fleurs_shuffled)
+    random.shuffle(musan_shuffled)
+    random.shuffle(vocalset_shuffled)
+    
+    # Sample from each shuffled source based on quotas
+    selected_libri = libri_shuffled[:min(q_libri, len(libri))]
+    selected_fleurs = fleurs_shuffled[:min(q_fleurs, len(fleurs_speech))]
+    selected_musan = musan_shuffled[:min(q_musan, len(musan_speech))]
+    selected_vocalset = vocalset_shuffled[:min(q_vocalset, len(vocalset_speech))]
 
     # Combine all selected speech samples
     selected_speech = (
@@ -2496,6 +2949,7 @@ def make_pos_neg(
     n_music_only = int(round(actual_n_neg * neg_music_ratio))
     n_noise_noise = int(round(actual_n_neg * neg_noise_noise_ratio))  # New quota
     n_music_music = int(round(actual_n_neg * neg_music_music_ratio))  # New quota
+    n_urbansound = int(round(actual_n_neg * neg_urbansound_ratio))
     n_mixed = (
         actual_n_neg
         - n_noise_only
@@ -2503,6 +2957,7 @@ def make_pos_neg(
         - n_music_only
         - n_noise_noise
         - n_music_music
+        - n_urbansound
     )  # Update remainder guard
 
     logger.info(f"Target negative samples: {actual_n_neg} total")
@@ -2703,6 +3158,35 @@ def make_pos_neg(
         f"Generated {music_music_generated} music+music samples ({music_music_failures} failed validation)"
     )
 
+    # 7. Generate UrbanSound8K samples
+    if n_urbansound > 0:
+        logger.info(f"Generating {n_urbansound} UrbanSound8K samples")
+        urbansound_generated = 0
+        urbansound_failures = 0
+
+        for idx in tqdm(range(n_urbansound), desc="Generating UrbanSound8K samples"):
+            duration = random.uniform(*duration_range)
+            audio, vad_labels = create_negative_sample(
+                urbansound_noise,
+                duration,
+                sample_rate,
+                win_length,
+                hop_length,
+                category="urbansound"
+            )
+
+            # Validate before saving
+            if not validate_audio_sample(audio, sample_rate):
+                urbansound_failures += 1
+                continue
+
+            # Save the validated sample
+            sf.write(out_neg / f"neg_urbansound_{idx:06}.wav", audio, sample_rate)
+            np.save(out_neg_labels / f"neg_urbansound_{idx:06}_labels.npy", vad_labels)
+            urbansound_generated += 1
+
+        logger.info(f"Generated {urbansound_generated} UrbanSound8K samples ({urbansound_failures} failed validation)")
+
     neg_time = time.time() - start_time
     logger.info(
         f"Completed {actual_n_neg} negative samples in {neg_time:.2f}s ({neg_time/actual_n_neg:.3f}s per sample)"
@@ -2790,15 +3274,14 @@ def prepare_dataset(
     duration_range: tuple = (5, 10),
     sample_rate: int = 16000,
     force_rebuild: bool = False,
-    use_full_dataset: bool = False,
     fleurs_langs: str = None,
     fleurs_streaming: bool = False,
-    use_additional_datasets: bool = True,  # Add this parameter
-    neg_noise_ratio=0.30,
+    neg_noise_ratio=0.20,
     neg_esc50_ratio=0.20,
-    neg_music_ratio=0.25,
+    neg_music_ratio=0.20,
     neg_noise_noise_ratio=0.10,
     neg_music_music_ratio=0.10,
+    neg_urbansound_ratio=0.20,
     use_silero_vad: bool = True,
 ):
     """
@@ -2840,26 +3323,20 @@ def prepare_dataset(
             # For test, we need test-clean
             download_and_extract(TEST_CLEAN_URL, root)
             download_and_extract(MUSAN_URL, root)
-            # Add additional datasets for test if requested
-            if use_additional_datasets:
-                download_and_extract_zip(ESC_50_URL, root)
-                download_and_extract_zip(VOCALSET_URL, root)
+            download_and_extract_zip(ESC_50_URL, root)
+            download_and_extract_zip(VOCALSET_URL, root)
         elif split == "val":
             # For validation, we need dev-clean
             download_and_extract(VAL_LIBRISPEECH_URL, root)
             download_and_extract(MUSAN_URL, root)
-            # Add additional datasets for validation if requested
-            if use_additional_datasets:
-                download_and_extract_zip(ESC_50_URL, root)
-                download_and_extract_zip(VOCALSET_URL, root)
+            download_and_extract_zip(ESC_50_URL, root)
+            download_and_extract_zip(VOCALSET_URL, root)
         else:  # train split
-            # For training, we need train-clean-360
+            # For training, we need train-clean-100
             download_and_extract(TRAIN_LIBRISPEECH_URL, root)
             download_and_extract(MUSAN_URL, root)
-            # Add additional datasets for training if requested
-            if use_additional_datasets:
-                download_and_extract_zip(ESC_50_URL, root)
-                download_and_extract_zip(VOCALSET_URL, root)
+            download_and_extract_zip(ESC_50_URL, root)
+            download_and_extract_zip(VOCALSET_URL, root)
 
         state["downloads_complete"] = True
         with open(state_file, "w") as f:
@@ -2874,7 +3351,7 @@ def prepare_dataset(
         elif split == "val":
             libri_root = root / "LibriSpeech" / "dev-clean"
         else:  # train split
-            libri_root = root / "LibriSpeech" / "train-clean-360"
+            libri_root = root / "LibriSpeech" / "train-clean-100"
 
         musan_root = root / "musan"
         prep = root / "prepared" / split
@@ -2904,14 +3381,15 @@ def prepare_dataset(
             duration_range=duration_range,
             sample_rate=sample_rate,
             split_name=split,
-            use_full_dataset=use_full_dataset,
             fleurs_langs=fleurs_langs,
             fleurs_streaming=fleurs_streaming,
             speech_dir=root / "fleurs_speech",
             neg_noise_ratio=neg_noise_ratio,
             neg_esc50_ratio=neg_esc50_ratio,
             neg_music_ratio=neg_music_ratio,
-            use_additional_datasets=use_additional_datasets,
+            neg_noise_noise_ratio=neg_noise_noise_ratio,
+            neg_music_music_ratio=neg_music_music_ratio,
+            neg_urbansound_ratio=neg_urbansound_ratio
             vad_model=vad_model,
         )
 
@@ -2993,11 +3471,6 @@ def main(args=None):
             "--seed", type=int, default=42, help="Random seed for reproducibility"
         )
         parser.add_argument(
-            "--use_full_dataset",
-            action="store_true",
-            help="Use the entire dataset (ignores n_pos and n_neg count limits)",
-        )
-        parser.add_argument(
             "--fleurs_langs",
             default="id_id,yue_hant_hk,ka_ge,xh_za,yo_ng,ar_eg,hi_in,ta_in,vi_vn,mi_nz",
             help=(
@@ -3013,45 +3486,21 @@ def main(args=None):
             help="Stream FLEURS instead of downloading it (saves disk but no random access).",
         )
         parser.add_argument(
-            "--fraction_fleurs",
-            type=float,
-            default=0.20,
-            help="Fraction of positive samples from FLEURS",
-        )
-        parser.add_argument(
-            "--fraction_libri",
-            type=float,
-            default=0.60,
-            help="Fraction of positive samples from LibriSpeech",
-        )
-        parser.add_argument(
-            "--fraction_musan",
-            type=float,
-            default=0.20,
-            help="Fraction of positive samples from MUSAN speech",
-        )
-        parser.add_argument(
-            "--use_additional_datasets",
-            action="store_true",
-            default=True,
-            help="Use ESC-50 (noise) and VocalSet (singing) datasets in addition to LibriSpeech and MUSAN",
-        )
-        parser.add_argument(
             "--neg_noise_ratio",
             type=float,
-            default=0.30,
+            default=0.2,
             help="Fraction of negative samples that are pure noise",
         )
         parser.add_argument(
             "--neg_esc50_ratio",
             type=float,
-            default=0.20,
+            default=0.2,
             help="Fraction of negative samples that are ESC-50 sounds",
         )
         parser.add_argument(
             "--neg_music_ratio",
             type=float,
-            default=0.25,
+            default=0.2,
             help="Fraction of negative samples that are music",
         )
         parser.add_argument(
@@ -3067,6 +3516,12 @@ def main(args=None):
             help="Fraction of negative samples that are music+music combinations",
         )
         parser.add_argument(
+            "--neg_urbansound_ratio",
+            type=float,
+            default=0.2,
+            help="Fraction of negative samples that are UrbanSound8K sounds"
+        )
+        parser.add_argument(
             "--use_silero_vad",
             action="store_true",
             default=True,
@@ -3078,19 +3533,15 @@ def main(args=None):
     # Set seed for reproducibility
     seed_everything(args.seed)
 
-    global FRACTION_FLEURS, FRACTION_LIBRI, FRACTION_MUSAN
-    FRACTION_FLEURS = args.fraction_fleurs
-    FRACTION_LIBRI = args.fraction_libri
-    FRACTION_MUSAN = args.fraction_musan
-
-    # Validate that fractions sum to 1.0
-    if abs(FRACTION_FLEURS + FRACTION_LIBRI + FRACTION_MUSAN - 1.0) > 1e-6:
-        logger.warning(
-            f"Source fractions sum to {FRACTION_FLEURS + FRACTION_LIBRI + FRACTION_MUSAN}, not 1.0"
-        )
-
     # Replace the warning with this auto-adjustment code
-    neg_sum = args.neg_noise_ratio + args.neg_esc50_ratio + args.neg_music_ratio
+    neg_sum = (
+        args.neg_noise_ratio
+        + args.neg_esc50_ratio
+        + args.neg_music_ratio
+        + args.neg_noise_noise_ratio
+        + args.neg_music_music_ratio
+        + args.neg_urbansound_ratio
+    )
     if abs(neg_sum - 1.0) > 1e-6:  # If not approximately 1.0
         logger.warning(
             f"Negative sample ratios sum to {neg_sum}, which differs from 1.0. "
@@ -3101,9 +3552,15 @@ def main(args=None):
         args.neg_noise_ratio *= scaling_factor
         args.neg_esc50_ratio *= scaling_factor
         args.neg_music_ratio *= scaling_factor
+        args.neg_noise_noise_ratio *= scaling_factor
+        args.neg_music_music_ratio *= scaling_factor
+        args.neg_urbansound_ratio *= scaling_factor
         logger.info(
             f"Adjusted ratios: noise={args.neg_noise_ratio:.3f}, "
-            f"esc50={args.neg_esc50_ratio:.3f}, music={args.neg_music_ratio:.3f}"
+            f"esc50={args.neg_esc50_ratio:.3f}, music={args.neg_music_ratio:.3f}, "
+            f"noise_noise={args.neg_noise_noise_ratio:.3f}, "
+            f"music_music={args.neg_music_music_ratio:.3f}"
+            f"urbansound={args.neg_urbansound_ratio:.3f}"
         )
 
     # Process each requested split
@@ -3117,26 +3574,18 @@ def main(args=None):
             duration_range=args.duration_range,
             sample_rate=args.sample_rate,
             force_rebuild=args.force if hasattr(args, "force") else False,
-            use_full_dataset=(
-                args.use_full_dataset if hasattr(args, "use_full_dataset") else False
-            ),
             fleurs_langs=args.fleurs_langs if hasattr(args, "fleurs_langs") else None,
             fleurs_streaming=(
                 args.fleurs_streaming if hasattr(args, "fleurs_streaming") else False
             ),
-            use_additional_datasets=(
-                args.use_additional_datasets
-                if hasattr(args, "use_additional_datasets")
-                else True
-            ),
             neg_noise_ratio=(
-                args.neg_noise_ratio if hasattr(args, "neg_noise_ratio") else 0.30
+                args.neg_noise_ratio if hasattr(args, "neg_noise_ratio") else 0.20
             ),
             neg_esc50_ratio=(
                 args.neg_esc50_ratio if hasattr(args, "neg_esc50_ratio") else 0.20
             ),
             neg_music_ratio=(
-                args.neg_music_ratio if hasattr(args, "neg_music_ratio") else 0.25
+                args.neg_music_ratio if hasattr(args, "neg_music_ratio") else 0.20
             ),
             neg_noise_noise_ratio=(
                 args.neg_noise_noise_ratio
@@ -3147,6 +3596,11 @@ def main(args=None):
                 args.neg_music_music_ratio
                 if hasattr(args, "neg_music_music_ratio")
                 else 0.10
+            ),
+            neg_urbansound_ratio=(
+                args.neg_urbansound_ratio
+                if hasattr(args, "neg_urbansound_ratio")
+                else 0.20
             ),
             use_silero_vad=(
                 args.use_silero_vad if hasattr(args, "use_silero_vad") else False
