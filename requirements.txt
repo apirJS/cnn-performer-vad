@@ -25,3 +25,4 @@ seaborn
 # Utilities
 tqdm
 requests
+silero_vad
