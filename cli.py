@@ -25,6 +25,7 @@ def setup_prepare_parser(subparsers):
     # Base arguments
     parser.add_argument(
         "--root",
+        required=True,
         help="Root directory for all datasets and outputs",
         default=DEFAULT_ROOT_DIR,
     )
@@ -61,15 +62,12 @@ def setup_prepare_parser(subparsers):
         help="Sample rate for audio processing",
     )
     parser.add_argument(
-        "--force", action="store_true", help="Force rebuild even if data already exists"
+        "--force",
+        action="store_true",
+        help="Force rebuild even if data already exists",
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
-    )
-    parser.add_argument(
-        "--use_full_dataset",
-        action="store_true",
-        help="Use the entire LibriSpeech dataset instead of sample sizes (only affects training set)",
     )
     parser.add_argument(
         "--fleurs_langs",
@@ -87,44 +85,21 @@ def setup_prepare_parser(subparsers):
         help="Stream FLEURS instead of downloading it (saves disk but no random access).",
     )
     parser.add_argument(
-        "--fraction_fleurs",
-        type=float,
-        default=0.20,
-        help="Fraction of positive samples from FLEURS",
-    )
-    parser.add_argument(
-        "--fraction_libri",
-        type=float,
-        default=0.60,
-        help="Fraction of positive samples from LibriSpeech",
-    )
-    parser.add_argument(
-        "--fraction_musan",
-        type=float,
-        default=0.20,
-        help="Fraction of positive samples from MUSAN speech",
-    )
-    parser.add_argument(
-        "--use_additional_datasets",
-        action="store_true",
-        help="Use ESC-50 (noise) and VocalSet (singing) datasets in addition to LibriSpeech and MUSAN",
-    )
-    parser.add_argument(
         "--neg_noise_ratio",
         type=float,
-        default=0.30,
+        default=0.2,
         help="Fraction of negative samples that are pure noise",
     )
     parser.add_argument(
         "--neg_esc50_ratio",
         type=float,
-        default=0.20,
+        default=0.2,
         help="Fraction of negative samples that are ESC-50 sounds",
     )
     parser.add_argument(
         "--neg_music_ratio",
         type=float,
-        default=0.25,
+        default=0.2,
         help="Fraction of negative samples that are music",
     )
     parser.add_argument(
@@ -138,6 +113,12 @@ def setup_prepare_parser(subparsers):
         type=float,
         default=0.1,
         help="Fraction of negative samples that are music+music combinations",
+    )
+    parser.add_argument(
+        "--neg_urbansound_ratio",
+        type=float,
+        default=0.2,
+        help="Fraction of negative samples that are UrbanSound8K sounds"
     )
     parser.add_argument(
         "--use_silero_vad",
