@@ -50,7 +50,7 @@ MAX_PER_LANG_TEST = 400
 
 def initialize_silero_vad(
     model_path: Optional[str] = None, force_reload: bool = False, device: str = None
-) -> Tuple[torch.nn.Module, Dict[str, float]]:
+) -> Tuple[torch.nn.Module, Dict]:
     """
     Initialize the Silero VAD model.
     """
@@ -59,30 +59,59 @@ def initialize_silero_vad(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    if model_path and Path(model_path).exists():
-        logger.info(f"Loading Silero VAD from local path: {model_path}")
-        model = torch.jit.load(model_path, map_location=device)
-        # Import utils separately when loading locally
-        _, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=False,
-            onnx=False,
-            verbose=False,
-            trust_repo=True,
+    # Try using the silero-vad package (preferred method)
+    try:
+        from silero_vad import (
+            load_silero_vad,
+            get_speech_timestamps,
+            save_audio,
+            read_audio,
+            VADIterator,
+            collect_chunks
         )
-    else:
-        logger.info("Downloading Silero VAD from torch hub")
-        # Use torch hub to get the model and utils
-        model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=force_reload,
-            onnx=False,
-            verbose=False,
-            trust_repo=True,
-        )
+        
+        # Load model using the pip package
+        logger.info("Loading Silero VAD using pip package (recommended method)")
+        model = load_silero_vad(onnx=False)
         model = model.to(device)
+        
+        # Create utils dictionary that matches torch.hub structure
+        utils = {
+            "get_speech_timestamps": get_speech_timestamps,
+            "save_audio": save_audio,
+            "read_audio": read_audio,
+            "VADIterator": VADIterator,
+            "collect_chunks": collect_chunks
+        }
+        
+    except ImportError:
+        logger.info("silero-vad package not found, falling back to torch.hub")
+        
+        # Handle local model path if provided
+        if model_path and Path(model_path).exists():
+            logger.info(f"Loading Silero VAD from local path: {model_path}")
+            model = torch.jit.load(model_path, map_location=device)
+            # Import utils separately when loading locally
+            _, utils = torch.hub.load(
+                repo_or_dir="snakers4/silero-vad",
+                model="silero_vad",
+                force_reload=False,
+                onnx=False,
+                verbose=False,
+                trust_repo=True,
+            )
+        else:
+            logger.info("Downloading Silero VAD from torch hub")
+            # Use torch hub to get the model and utils
+            model, utils = torch.hub.load(
+                repo_or_dir="snakers4/silero-vad",
+                model="silero_vad",
+                force_reload=force_reload,
+                onnx=False,
+                verbose=False,
+                trust_repo=True,
+            )
+            model = model.to(device)
 
     logger.info("Silero VAD model initialized successfully")
     return model, utils
@@ -1419,6 +1448,7 @@ def process_musdb(
     root_dir: pathlib.Path,
     split_name: str = "train",
     sample_rate: int = 16000,
+    cleanup_stems: bool = True,  # Add a parameter to control cleanup
 ) -> list[pathlib.Path]:
     """
     Process MUSDB18HQ dataset and combine bass, drums, and other tracks into a single instrumental WAV file.
@@ -1427,6 +1457,7 @@ def process_musdb(
         root_dir: Root directory where dataset should be stored
         split_name: Which split to use ('train', 'val', or 'test')
         sample_rate: Target sample rate
+        cleanup_stems: Whether to delete original stems after combining (saves disk space)
 
     Returns:
         List of paths to combined instrumental audio files
@@ -1434,6 +1465,10 @@ def process_musdb(
     # Create musdb18hq directory if it doesn't exist
     musdb_root = root_dir / "musdb18hq"
     musdb_root.mkdir(parents=True, exist_ok=True)
+    
+    # Create a directory to store processing markers
+    markers_dir = musdb_root / ".markers"
+    markers_dir.mkdir(exist_ok=True, parents=True)
 
     # First, download and extract the dataset if needed
     try:
@@ -1460,25 +1495,52 @@ def process_musdb(
 
     # Process each song
     for song_dir in tqdm(song_dirs, desc="Processing MUSDB songs"):
+        # Create a unique marker file path for this song
+        marker_file = markers_dir / f"{search_dir.name}_{song_dir.name}_processed.marker"
+        
         # Define paths for all stems
         bass_path = song_dir / "bass.wav"
         drums_path = song_dir / "drums.wav"
         other_path = song_dir / "other.wav"
+        vocals_path = song_dir / "vocals.wav"  # Also track vocals for potential deletion
 
+        # Define output file path - maintain existing directory structure
+        output_path = song_dir / "instrumental.wav"
+
+        # Skip if the combined file already exists and has a marker
+        if output_path.exists() and marker_file.exists():
+            logger.info(
+                f"Combined file already exists for {song_dir.name} (marked as processed), skipping"
+            )
+            music_files.append(output_path)
+            continue
+        
         # Check if all required stems exist
         if not (bass_path.exists() and drums_path.exists() and other_path.exists()):
             logger.warning(f"Missing stems for {song_dir.name}, skipping")
             continue
 
-        # Define output file path - maintain existing directory structure
-        output_path = song_dir / "instrumental.wav"
-
-        # Skip if the combined file already exists
+        # Skip if the combined file already exists (but not marked)
         if output_path.exists():
             logger.info(
-                f"Combined file already exists for {song_dir.name}, skipping generation"
+                f"Combined file exists for {song_dir.name} but not marked, adding to tracking"
             )
+            # Create marker file to indicate this song is processed
+            marker_file.touch()
             music_files.append(output_path)
+            
+            # If cleanup is requested and not already done
+            if cleanup_stems and all(p.exists() for p in [bass_path, drums_path, other_path]):
+                logger.info(f"Cleaning up stem files for {song_dir.name}")
+                # Remove stem files to save space
+                stem_files = [bass_path, drums_path, other_path]
+                if vocals_path.exists():
+                    stem_files.append(vocals_path)
+                    
+                for stem in stem_files:
+                    stem.unlink()
+                logger.info(f"Removed {len(stem_files)} stem files from {song_dir.name}")
+                
             continue
 
         # Load all stems
@@ -1502,8 +1564,23 @@ def process_musdb(
             # Save combined track
             sf.write(output_path, combined, sample_rate)
 
+            # Create marker file to indicate this song is processed
+            marker_file.touch()
+            
             logger.info(f"Created combined instrumental track for {song_dir.name}")
             music_files.append(output_path)
+            
+            # Clean up stem files if requested
+            if cleanup_stems:
+                logger.info(f"Cleaning up stem files for {song_dir.name}")
+                # Remove stem files to save space
+                stem_files = [bass_path, drums_path, other_path]
+                if vocals_path.exists():
+                    stem_files.append(vocals_path)
+                    
+                for stem in stem_files:
+                    stem.unlink()
+                logger.info(f"Removed {len(stem_files)} stem files from {song_dir.name}")
 
         except Exception as e:
             logger.error(f"Error processing {song_dir.name}: {e}")
@@ -1884,7 +1961,7 @@ def make_pos_neg(
         # Process ESC-50 for noise sources
         root_dir = out_pos.parent.parent
         esc50_noise = process_esc50(
-            root_dir=root_dir, split_name=split_name, sample_rate=sample_rate
+            root_dir=root_dir.parent, split_name=split_name, sample_rate=sample_rate
         )
         logger.info(f"Added {len(esc50_noise)} ESC-50 noise files")
 
