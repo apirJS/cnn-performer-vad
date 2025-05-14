@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # URL constants
-TRAIN_LIBRISPEECH_URL = "https://www.openslr.org/resources/12/train-clean-100.tar.gz"
+TRAIN_LIBRISPEECH_URL = "https://www.openslr.org/resources/12/train-clean-360.tar.gz"
 VAL_LIBRISPEECH_URL = "https://www.openslr.org/resources/12/dev-clean.tar.gz"
 TEST_CLEAN_URL = "https://www.openslr.org/resources/12/test-clean.tar.gz"
 MUSAN_URL = "https://www.openslr.org/resources/17/musan.tar.gz"
@@ -3332,7 +3332,7 @@ def prepare_dataset(
             download_and_extract_zip(ESC_50_URL, root)
             download_and_extract_zip(VOCALSET_URL, root)
         else:  # train split
-            # For training, we need train-clean-100
+            # For training, we need train-clean-360
             download_and_extract(TRAIN_LIBRISPEECH_URL, root)
             download_and_extract(MUSAN_URL, root)
             download_and_extract_zip(ESC_50_URL, root)
@@ -3351,7 +3351,7 @@ def prepare_dataset(
         elif split == "val":
             libri_root = root / "LibriSpeech" / "dev-clean"
         else:  # train split
-            libri_root = root / "LibriSpeech" / "train-clean-100"
+            libri_root = root / "LibriSpeech" / "train-clean-360"
 
         musan_root = root / "musan"
         prep = root / "prepared" / split
@@ -3389,7 +3389,7 @@ def prepare_dataset(
             neg_music_ratio=neg_music_ratio,
             neg_noise_noise_ratio=neg_noise_noise_ratio,
             neg_music_music_ratio=neg_music_music_ratio,
-            neg_urbansound_ratio=neg_urbansound_ratio
+            neg_urbansound_ratio=neg_urbansound_ratio,
             vad_model=vad_model,
         )
 
