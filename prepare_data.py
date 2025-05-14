@@ -34,7 +34,7 @@ MUSAN_URL = "https://www.openslr.org/resources/17/musan.tar.gz"
 ESC_50_URL = "https://github.com/karoldvl/ESC-50/archive/master.zip"
 VOCALSET_URL = "https://zenodo.org/records/1193957/files/VocalSet.zip?download=1"
 MUSDB18HQ_URL = "https://zenodo.org/records/3338373/files/musdb18hq.zip?download=1"
-URBANSOUND8K = "https://goo.gl/8hY5ER"
+URBANSOUND8K_URL = "https://goo.gl/8hY5ER"
 
 MAX_PER_LANG_TRAIN = 1000  # FLEURS gives ≈1000 train clips per language
 MAX_PER_LANG_VAL = 400  # idem for dev
@@ -1578,6 +1578,84 @@ def create_clean_speech_sample(
 
     return speech, vad_labels
 
+# Add this function at the top of your file (near other utility functions)
+def safe_augment_audio(audio_segment, sample_rate):
+    """
+    Safely apply augmentations with proper error handling.
+    """
+    augmented = audio_segment.copy()
+    
+    try:
+        # 1. Time Stretching (90% chance for diversity)
+        if random.random() < 0.9:
+            stretch_factor = random.uniform(0.85, 1.15)
+            augmented = librosa.effects.time_stretch(augmented, rate=stretch_factor)
+        
+        # 2. Pitch Shifting (80% chance)
+        if random.random() < 0.8:
+            pitch_steps = random.uniform(-2, 2)
+            augmented = librosa.effects.pitch_shift(
+                augmented, sr=sample_rate, n_steps=pitch_steps
+            )
+        
+        # 3. Volume Scaling (90% chance)
+        if random.random() < 0.9:
+            volume_factor = random.uniform(0.6, 1.4)
+            augmented = augmented * volume_factor
+        
+        # 4. Low-level noise addition (50% chance)
+        if random.random() < 0.5:
+            noise = np.random.randn(len(augmented))
+            noise_level = random.uniform(0.001, 0.01)
+            augmented = augmented + noise * noise_level
+        
+        # 5. Reverb (60% chance)
+        if random.random() < 0.6:
+            try:
+                wet_level = random.uniform(0.1, 0.5)
+                augmented = add_reverb(augmented, sample_rate, wet_level)
+            except Exception as reverb_error:
+                logger.warning(f"Reverb error (skipping this effect): {reverb_error}")
+        
+        # 6. EQ Filtering (70% chance) - use existing apply_eq function with exception handling
+        if random.random() < 0.7:
+            try:
+                augmented = apply_eq(augmented, sample_rate)
+            except Exception as eq_error:
+                logger.warning(f"EQ error (skipping this effect): {eq_error}")
+        
+        # 7. Random silence insertion (30% chance)
+        if random.random() < 0.3 and len(augmented) > sample_rate * 3:
+            silence_duration = random.uniform(0.05, 0.3)  # 50-300ms
+            silence_samples = int(silence_duration * sample_rate)
+            silence_pos = random.randint(0, len(augmented) - silence_samples)
+            augmented[silence_pos:silence_pos + silence_samples] = 0
+        
+        # 8. Shuffling chunks (15% chance - experimental)
+        if random.random() < 0.15 and len(augmented) > sample_rate * 5:
+            # Only for longer segments
+            chunk_size = int(sample_rate * random.uniform(0.5, 1.0))
+            if chunk_size < len(augmented) / 4:  # Ensure we have enough chunks
+                # Split into chunks
+                chunks = [augmented[i:i+chunk_size] for i in range(0, len(augmented), chunk_size)]
+                # Shuffle some consecutive chunks
+                shuffle_start = random.randint(0, len(chunks) - 3)
+                shuffle_end = min(shuffle_start + random.randint(2, 4), len(chunks))
+                random.shuffle(chunks[shuffle_start:shuffle_end])
+                # Recombine
+                augmented = np.concatenate(chunks)
+        
+        # Ensure consistent length
+        augmented = librosa.util.fix_length(augmented, size=len(audio_segment))
+        
+        # Normalize to prevent clipping
+        augmented = augmented / (np.max(np.abs(augmented)) + 1e-7)
+        
+        return augmented, True
+        
+    except Exception as e:
+        logger.warning(f"Error during audio augmentation: {e}")
+        return audio_segment, False  # Return original with failure flag
 
 def process_musdb(
     root_dir: pathlib.Path,
@@ -1841,6 +1919,7 @@ def process_musdb(
                 # Load the original audio
                 audio, _ = librosa.load(source_path, sr=sample_rate)
                 
+                # Replace the augmentation loop in process_musdb with this version
                 for aug_idx in range(augmentations_per_segment):
                     # Create a unique name for this augmentation
                     aug_name = f"{source_path.stem}_aug{aug_idx}.wav"
@@ -1852,72 +1931,15 @@ def process_musdb(
                         continue
                     
                     # Start with the original audio
-                    augmented = audio.copy()
+                    augmented, success = safe_augment_audio(audio, sample_rate)
                     
-                    # Apply a random selection of augmentations
-                    
-                    # 1. Time Stretching (90% chance for diversity)
-                    if random.random() < 0.9:
-                        stretch_factor = random.uniform(0.85, 1.15)
-                        augmented = librosa.effects.time_stretch(augmented, rate=stretch_factor)
-                    
-                    # 2. Pitch Shifting (80% chance)
-                    if random.random() < 0.8:
-                        pitch_steps = random.uniform(-2, 2)
-                        augmented = librosa.effects.pitch_shift(
-                            augmented, sr=sample_rate, n_steps=pitch_steps
-                        )
-                    
-                    # 3. Volume Scaling (90% chance)
-                    if random.random() < 0.9:
-                        volume_factor = random.uniform(0.6, 1.4)
-                        augmented = augmented * volume_factor
-                    
-                    # 4. Low-level noise addition (50% chance)
-                    if random.random() < 0.5:
-                        noise = np.random.randn(len(augmented))
-                        noise_level = random.uniform(0.001, 0.01)
-                        augmented = augmented + noise * noise_level
-                    
-                    # 5. Reverb (60% chance)
-                    if random.random() < 0.6:
-                        wet_level = random.uniform(0.1, 0.5)
-                        augmented = add_reverb(augmented, sample_rate, wet_level)
-                    
-                    # 6. EQ Filtering (70% chance) - use existing apply_eq function
-                    if random.random() < 0.7:
-                        augmented = apply_eq(augmented, sample_rate)
-                    
-                    # 7. Random silence insertion (30% chance)
-                    if random.random() < 0.3 and len(augmented) > sample_rate * 3:
-                        silence_duration = random.uniform(0.05, 0.3)  # 50-300ms
-                        silence_samples = int(silence_duration * sample_rate)
-                        silence_pos = random.randint(0, len(augmented) - silence_samples)
-                        augmented[silence_pos:silence_pos + silence_samples] = 0
-                    
-                    # 8. Shuffling chunks (15% chance - experimental)
-                    if random.random() < 0.15 and len(augmented) > sample_rate * 5:
-                        # Only for longer segments
-                        chunk_size = int(sample_rate * random.uniform(0.5, 1.0))
-                        if chunk_size < len(augmented) / 4:  # Ensure we have enough chunks
-                            # Split into chunks
-                            chunks = [augmented[i:i+chunk_size] for i in range(0, len(augmented), chunk_size)]
-                            # Shuffle some consecutive chunks
-                            shuffle_start = random.randint(0, len(chunks) - 3)
-                            shuffle_end = min(shuffle_start + random.randint(2, 4), len(chunks))
-                            random.shuffle(chunks[shuffle_start:shuffle_end])
-                            # Recombine
-                            augmented = np.concatenate(chunks)
-                    
-                    # Ensure consistent length
-                    augmented = librosa.util.fix_length(augmented, size=len(audio))
-                    
-                    # Normalize to prevent clipping
-                    augmented = augmented / (np.max(np.abs(augmented)) + 1e-7)
-                    
-                    # Save the augmented sample
-                    sf.write(aug_path, augmented, sample_rate)
-                    augmented_files.append(aug_path)
+                    # Only save if augmentation was successful
+                    if success:
+                        # Save the augmented sample
+                        sf.write(aug_path, augmented, sample_rate)
+                        augmented_files.append(aug_path)
+                    else:
+                        logger.warning(f"Skipping failed augmentation {aug_idx} for {source_path.stem}")
                 
                 # Mark that we've augmented this file
                 aug_marker.touch()
@@ -2307,6 +2329,45 @@ def stratified_librispeech_sample(libri_files, n_samples=10000):
     # If we have too many, trim
     return stratified_files[:n_samples]
 
+def stratified_fleurs_sample(fleurs_files, n_samples=10000):
+    """Sample FLEURS files with stratification by language."""
+    # Handle empty input case
+    if not fleurs_files:
+        logger.warning("Empty FLEURS file list provided to stratified sampling function")
+        return []
+        
+    # Group files by language code
+    languages = {}
+    for file_path in fleurs_files:
+        # Extract language code from filename (format: {lang_code}_{id}.wav)
+        lang_code = file_path.stem.split('_')[0]
+        if lang_code not in languages:
+            languages[lang_code] = []
+        languages[lang_code].append(file_path)
+    
+    # Calculate per-language quota
+    n_languages = len(languages)
+    logger.info(f"Found {n_languages} languages in FLEURS dataset")
+    per_language = max(1, n_samples // n_languages)
+    
+    # Take samples from each language
+    stratified_files = []
+    for lang, files in languages.items():
+        # Take up to per_language files from each language
+        n_to_take = min(per_language, len(files))
+        random.shuffle(files)  # Shuffle within language
+        stratified_files.extend(files[:n_to_take])
+        logger.info(f"Selected {n_to_take} samples from language '{lang}'")
+    
+    # If we need more samples to reach n_samples, add randomly
+    if len(stratified_files) < n_samples:
+        remaining = [f for f in fleurs_files if f not in stratified_files]
+        random.shuffle(remaining)
+        stratified_files.extend(remaining[:n_samples-len(stratified_files)])
+    
+    # If we have too many, trim
+    return stratified_files[:n_samples]
+
 def make_pos_neg(
     libri_root: pathlib.Path,
     musan_root: pathlib.Path,
@@ -2501,7 +2562,7 @@ def make_pos_neg(
 
     # Shuffle each source before sampling
     libri_shuffled = libri.copy()
-    fleurs_shuffled = fleurs_speech.copy()
+    fleurs_shuffled = stratified_fleurs_sample(fleurs_speech, n_samples=min(q_fleurs, len(fleurs_speech)))
     musan_shuffled = musan_speech.copy()
     vocalset_shuffled = vocalset_speech.copy()
     
@@ -3325,18 +3386,21 @@ def prepare_dataset(
             download_and_extract(MUSAN_URL, root)
             download_and_extract_zip(ESC_50_URL, root)
             download_and_extract_zip(VOCALSET_URL, root)
+            download_and_extract_urbansound8k(URBANSOUND8K_URL, root)
         elif split == "val":
             # For validation, we need dev-clean
             download_and_extract(VAL_LIBRISPEECH_URL, root)
             download_and_extract(MUSAN_URL, root)
             download_and_extract_zip(ESC_50_URL, root)
             download_and_extract_zip(VOCALSET_URL, root)
+            download_and_extract_urbansound8k(URBANSOUND8K_URL, root)
         else:  # train split
             # For training, we need train-clean-360
             download_and_extract(TRAIN_LIBRISPEECH_URL, root)
             download_and_extract(MUSAN_URL, root)
             download_and_extract_zip(ESC_50_URL, root)
             download_and_extract_zip(VOCALSET_URL, root)
+            download_and_extract_urbansound8k(URBANSOUND8K_URL, root)
 
         state["downloads_complete"] = True
         with open(state_file, "w") as f:
