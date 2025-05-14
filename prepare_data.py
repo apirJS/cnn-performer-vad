@@ -27,12 +27,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # URL constants
-TRAIN_LIBRISPEECH_URL = "https://www.openslr.org/resources/12/train-clean-100.tar.gz"
+TRAIN_LIBRISPEECH_URL = "https://www.openslr.org/resources/12/train-clean-360.tar.gz"
 VAL_LIBRISPEECH_URL = "https://www.openslr.org/resources/12/dev-clean.tar.gz"
 TEST_CLEAN_URL = "https://www.openslr.org/resources/12/test-clean.tar.gz"
 MUSAN_URL = "https://www.openslr.org/resources/17/musan.tar.gz"
 ESC_50_URL = "https://github.com/karoldvl/ESC-50/archive/master.zip"
 VOCALSET_URL = "https://zenodo.org/records/1193957/files/VocalSet.zip?download=1"
+MUSDB18HQ_URL = "https://zenodo.org/records/3338373/files/musdb18hq.zip?download=1"
 
 FRACTION_FLEURS = 0.50  # 50% of positives from FLEURS
 FRACTION_LIBRI = 0.30  # 30% of positives from LibriSpeech
@@ -126,16 +127,18 @@ def generate_silero_vad_labels(
             return_seconds=False,
         )
     else:
-        # Fallback to hub's function
-        speech_timestamps = torch.hub.load(
+        # Fallback - load the model and get the utils
+        model_obj, utils = torch.hub.load(
             repo_or_dir="snakers4/silero-vad",
             model="silero_vad",
             force_reload=False,
             onnx=False,
             verbose=False,
-            utils_only=True,
             trust_repo=True
-        )["get_speech_timestamps"](
+        )
+        
+        # Now use the loaded utils
+        speech_timestamps = utils["get_speech_timestamps"](
             audio_tensor,
             model,
             threshold=threshold,
@@ -395,7 +398,7 @@ def process_esc50(
         List of paths to noise audio files for the requested split
     """
     # Find the ESC-50 directory
-    esc50_dirs = list(root_dir.glob("*ESC-50*"))
+    esc50_dirs = list(root_dir.glob("*ESC-50-master*"))
     if not esc50_dirs:
         logger.warning(f"ESC-50 directory not found in {root_dir}")
         return []
@@ -1282,92 +1285,85 @@ def process_musdb(
     sample_rate: int = 16000,
 ) -> list[pathlib.Path]:
     """
-    Process MUSDB HQ dataset, handling train/val/test splits from the actual directory structure.
-    Returns paths to all WAV files found in the dataset, excluding vocals and mixtures.
+    Process MUSDB18HQ dataset from direct Zenodo download.
+    Returns paths to WAV files with vocals and mixtures excluded.
+    
+    Args:
+        root_dir: Root directory where dataset should be stored
+        split_name: Which split to use ('train', 'val', or 'test')
+        sample_rate: Target sample rate
+        
+    Returns:
+        List of paths to non-vocal, non-mixture audio files
     """
-    download_root = root_dir
+    # Create musdb18hq directory if it doesn't exist
     musdb_root = root_dir / "musdb18hq"
-    musdb_root.mkdir(exist_ok=True, parents=True)
+    musdb_root.mkdir(parents=True, exist_ok=True)
+    
+    # First, download and extract the dataset if needed
+    try:
+        # Download and extract the zip file
+        download_and_extract_zip(MUSDB18HQ_URL, musdb_root)
+        logger.info(f"MUSDB18HQ dataset downloaded and extracted successfully")
+    except Exception as e:
+        logger.error(f"Error downloading/extracting MUSDB18HQ dataset: {e}")
     
     # Initialize the list to store file paths
     music_files = []
     
-    # Map our split names to MUSDB parameters - simpler mapping
-    # For train/val: Use subset="train" but split the files differently
-    # For test: Use subset="test"
-    if split_name in ["train", "val"]:
-        musdb_subset = "train"
-        musdb_split = None  # Don't use MUSDB's internal split feature
-    else:  # test
-        musdb_subset = "test"
-        musdb_split = None
-    
-    logger.info(f"Loading MUSDB HQ data for {split_name} split (using subset={musdb_subset})")
-    
-    # Try to download MUSDB if not present
-    try:
-        # This will trigger download if needed
-        _ = MUSDB_HQ(
-            root=download_root, 
-            subset=musdb_subset, 
-            download=True, 
-            sources=["bass", "drums", "other"],  # Exclude "vocals" here
-            split=musdb_split
-        )
-    except Exception as e:
-        logger.error(f"Error accessing MUSDB HQ dataset: {e}")
-    
-    # MUSDB only has train and test folders, no nested structure
+    # MUSDB18HQ structure is: train/song_title/wav/ and test/song_title/wav/
     if split_name in ["train", "val"]:
         search_dir = musdb_root / "train"
-    else:
+    else:  # test
         search_dir = musdb_root / "test"
     
-    # Find all WAV files in the search directory, excluding vocals and mixtures
-    all_wav_files = []
+    logger.info(f"Looking for MUSDB18HQ files in {search_dir}")
+    
+    # Find all WAV files, excluding vocals and mixtures
     if search_dir.exists():
-        # Get all WAV files first
+        # Get all WAV files recursively
         all_wav_files = list(search_dir.rglob("*.wav"))
+        logger.info(f"Found {len(all_wav_files)} total WAV files in {search_dir}")
         
-        # Filter out any files containing "vocal" or "mixture" in their path (case-insensitive)
-        all_wav_files = [
+        # Filter out vocals and mixtures (case-insensitive)
+        filtered_files = [
             f for f in all_wav_files 
             if "vocal" not in str(f).lower() and "mixture" not in str(f).lower()
         ]
         
-        # Log the number of filtered files
-        logger.info(f"Found {len(all_wav_files)} suitable WAV files in {search_dir}")
-    
-    # For train/val, we need to split the files from the train folder
-    if split_name in ["train", "val"]:
-        # Use deterministic shuffling for consistent splits
-        random.seed(42)  # Fixed seed for reproducibility
-        random.shuffle(all_wav_files)
+        logger.info(f"After filtering vocals and mixtures: {len(filtered_files)} files")
         
-        # Split: 80% for train, 20% for validation
-        split_idx = int(0.8 * len(all_wav_files))
-        
-        if split_name == "train":
-            music_files = all_wav_files[:split_idx]
-            logger.info(f"Using {len(music_files)}/{len(all_wav_files)} files for training split")
-        else:  # val
-            music_files = all_wav_files[split_idx:]
-            logger.info(f"Using {len(music_files)}/{len(all_wav_files)} files for validation split")
-    else:
-        # For test, use all files from the test folder
-        music_files = all_wav_files
+        # For train/val, split the files from the train folder
+        if split_name in ["train", "val"]:
+            # Use deterministic shuffling for consistent splits
+            random.seed(42)  # Fixed seed for reproducibility
+            random.shuffle(filtered_files)
+            
+            # Split: 80% for train, 20% for validation
+            split_idx = int(0.8 * len(filtered_files))
+            
+            if split_name == "train":
+                music_files = filtered_files[:split_idx]
+            else:  # val
+                music_files = filtered_files[split_idx:]
+                
+            logger.info(f"Using {len(music_files)}/{len(filtered_files)} files for {split_name}")
+        else:
+            # For test, use all files from the test folder
+            music_files = filtered_files
+            logger.info(f"Using {len(music_files)} files for test split")
     
     # Create fallback if no files found
     if not music_files:
-        logger.warning(f"No suitable MUSDB audio files found for {split_name} split. Creating fallback audio.")
+        logger.warning(f"No suitable MUSDB18HQ audio files found. Creating fallback audio.")
         fallback_path = musdb_root / f"fallback_audio_{split_name}_{sample_rate//1000}k.wav"
         
         # Create silent audio
-        fallback_audio = np.zeros(sample_rate * 10)  # 10 seconds, mono
+        fallback_audio = np.zeros(sample_rate * 10)  # 10 seconds of silence
         sf.write(fallback_path, fallback_audio, sample_rate)
         music_files = [fallback_path]
+        logger.info(f"Created fallback audio file at {fallback_path}")
     
-    logger.info(f"Using {len(music_files)} MUSDB audio files for {split_name} split (vocals and mixtures excluded)")
     return music_files
 
 def create_speech_music_sample_with_silero(
@@ -2324,7 +2320,7 @@ def prepare_dataset(
                 download_and_extract_zip(ESC_50_URL, root)
                 download_and_extract_zip(VOCALSET_URL, root)
         else:  # train split
-            # For training, we need train-clean-100
+            # For training, we need train-clean-360
             download_and_extract(TRAIN_LIBRISPEECH_URL, root)
             download_and_extract(MUSAN_URL, root)
             # Add additional datasets for training if requested
@@ -2345,7 +2341,7 @@ def prepare_dataset(
         elif split == "val":
             libri_root = root / "LibriSpeech" / "dev-clean"
         else:  # train split
-            libri_root = root / "LibriSpeech" / "train-clean-100"
+            libri_root = root / "LibriSpeech" / "train-clean-360"
 
         musan_root = root / "musan"
         prep = root / "prepared" / split
