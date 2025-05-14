@@ -89,13 +89,13 @@ def setup_prepare_parser(subparsers):
     parser.add_argument(
         "--fraction_fleurs",
         type=float,
-        default=0.50,
+        default=0.20,
         help="Fraction of positive samples from FLEURS",
     )
     parser.add_argument(
         "--fraction_libri",
         type=float,
-        default=0.30,
+        default=0.60,
         help="Fraction of positive samples from LibriSpeech",
     )
     parser.add_argument(
@@ -112,13 +112,13 @@ def setup_prepare_parser(subparsers):
     parser.add_argument(
         "--neg_noise_ratio",
         type=float,
-        default=0.25,
+        default=0.30,
         help="Fraction of negative samples that are pure noise",
     )
     parser.add_argument(
         "--neg_esc50_ratio",
         type=float,
-        default=0.25,
+        default=0.20,
         help="Fraction of negative samples that are ESC-50 sounds",
     )
     parser.add_argument(
@@ -126,6 +126,18 @@ def setup_prepare_parser(subparsers):
         type=float,
         default=0.25,
         help="Fraction of negative samples that are music",
+    )
+    parser.add_argument(
+        "--neg_noise_noise_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of negative samples that are noise+noise combinations",
+    )
+    parser.add_argument(
+        "--neg_music_music_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of negative samples that are music+music combinations",
     )
     parser.add_argument(
         "--use_silero_vad",
