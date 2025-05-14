@@ -69,7 +69,7 @@ def initialize_silero_vad(
             force_reload=False,
             onnx=False,
             verbose=False,
-            trust_repo=True
+            trust_repo=True,
         )
     else:
         logger.info("Downloading Silero VAD from torch hub")
@@ -80,7 +80,7 @@ def initialize_silero_vad(
             force_reload=force_reload,
             onnx=False,
             verbose=False,
-            trust_repo=True
+            trust_repo=True,
         )
         model = model.to(device)
 
@@ -134,9 +134,9 @@ def generate_silero_vad_labels(
             force_reload=False,
             onnx=False,
             verbose=False,
-            trust_repo=True
+            trust_repo=True,
         )
-        
+
         # Now use the loaded utils
         speech_timestamps = utils["get_speech_timestamps"](
             audio_tensor,
@@ -263,13 +263,11 @@ def create_esc50_negative_sample(
 
 
 def process_vocalset(
-    root_dir: pathlib.Path, 
-    split_name: str = "train",
-    sample_rate: int = 16000
+    root_dir: pathlib.Path, split_name: str = "train", sample_rate: int = 16000
 ) -> list[pathlib.Path]:
     """
     Process VocalSet dataset with train/val/test splitting based on defined singer lists.
-    
+
     Args:
         root_dir: Root directory where dataset is extracted
         split_name: Which split to use ('train', 'val', or 'test')
@@ -285,14 +283,14 @@ def process_vocalset(
         root_dir / "VocalSet" / "FULL",
         root_dir / "VocalSet-master" / "FULL",
         root_dir.parent / "FULL",
-        root_dir.parent / "VocalSet" / "FULL"
+        root_dir.parent / "VocalSet" / "FULL",
     ]
-    
+
     glob_paths = list(root_dir.glob("**/[Ff][Uu][Ll][Ll]"))
     glob_parent_paths = list(root_dir.parent.glob("**/[Ff][Uu][Ll][Ll]"))
-    
+
     all_possible_paths = possible_paths + glob_paths + glob_parent_paths
-    
+
     # Find the first valid path
     vocalset_dir = None
     for path in all_possible_paths:
@@ -300,35 +298,48 @@ def process_vocalset(
             vocalset_dir = path
             logger.info(f"Found VocalSet directory at: {vocalset_dir}")
             break
-    
+
     if not vocalset_dir:
         logger.warning("VocalSet directory not found after exhaustive search")
         return []
-    
+
     # 2. Find ALL wav files first
     all_files = list(vocalset_dir.rglob("**/*.wav"))
     logger.info(f"Found total of {len(all_files)} WAV files in VocalSet")
-    
+
     # Debug info on file locations
     if len(all_files) > 0:
         sample_files = random.sample(all_files, min(5, len(all_files)))
         logger.info(f"Sample file paths: {[str(f) for f in sample_files]}")
-    
+
     # 3. Define singer IDs based on the text files
     # Test singers from test_singers.rtfd/TXT.rtf
     test_singers = ["female2", "female8", "male3", "male5", "male10"]
-    
+
     # Train singers from train_singers.rtfd/TXT.rtf
     train_singers_full = [
-        "female1", "female3", "female4", "female5", "female6", "female7", "female9",
-        "male1", "male2", "male4", "male6", "male7", "male8", "male9", "male11"
+        "female1",
+        "female3",
+        "female4",
+        "female5",
+        "female6",
+        "female7",
+        "female9",
+        "male1",
+        "male2",
+        "male4",
+        "male6",
+        "male7",
+        "male8",
+        "male9",
+        "male11",
     ]
-    
+
     # Split train singers into train and validation
     # Use female9, male8, male9 for validation (like in original code)
     val_singers = ["female9", "male8", "male9"]
     train_singers = [s for s in train_singers_full if s not in val_singers]
-    
+
     # Select the appropriate singers for this split
     if split_name == "train":
         target_singers = train_singers
@@ -336,59 +347,58 @@ def process_vocalset(
         target_singers = val_singers
     else:  # test
         target_singers = test_singers
-    
-    logger.info(f"Using {len(target_singers)} singers for {split_name} split: {target_singers}")
-    
+
+    logger.info(
+        f"Using {len(target_singers)} singers for {split_name} split: {target_singers}"
+    )
+
     # Build patterns for matching filenames
     all_patterns = []
     for singer in target_singers:
         # Add common pattern formats
-        all_patterns.extend([
-            f"{singer}_", 
-            f"{singer}/",
-            f"/{singer}/"
-        ])
-    
+        all_patterns.extend([f"{singer}_", f"{singer}/", f"/{singer}/"])
+
     # Find all WAV files that match any of the patterns
     vocal_files = []
     for file in all_files:
         file_str = str(file).lower()
         if any(pattern in file_str for pattern in all_patterns):
             vocal_files.append(file)
-    
+
     # 4. If pattern matching failed, fallback to random splitting
     if len(vocal_files) < 10:  # Very few files found with pattern matching
         logger.warning(
             f"Pattern matching found only {len(vocal_files)}/{len(all_files)} files. "
             f"Falling back to random split to avoid data loss."
         )
-        
+
         # Deterministic shuffling
         random.seed(42 + {"train": 0, "val": 1, "test": 2}[split_name])
         shuffled_files = list(all_files)
         random.shuffle(shuffled_files)
-        
+
         # Split: 70% train, 15% val, 15% test
         n_total = len(shuffled_files)
         if split_name == "train":
-            vocal_files = shuffled_files[:int(0.7 * n_total)]
+            vocal_files = shuffled_files[: int(0.7 * n_total)]
         elif split_name == "val":
-            vocal_files = shuffled_files[int(0.7 * n_total):int(0.85 * n_total)]
+            vocal_files = shuffled_files[int(0.7 * n_total) : int(0.85 * n_total)]
         else:  # test
-            vocal_files = shuffled_files[int(0.85 * n_total):]
-    
-    logger.info(f"Selected {len(vocal_files)} VocalSet audio files for {split_name} split")
+            vocal_files = shuffled_files[int(0.85 * n_total) :]
+
+    logger.info(
+        f"Selected {len(vocal_files)} VocalSet audio files for {split_name} split"
+    )
     return vocal_files
 
+
 def process_esc50(
-    root_dir: pathlib.Path, 
-    split_name: str = "train",
-    sample_rate: int = 16000
+    root_dir: pathlib.Path, split_name: str = "train", sample_rate: int = 16000
 ) -> list[pathlib.Path]:
     """
     Process ESC-50 dataset with proper train/val/test splitting based on the original folds.
     Excludes all human-related sounds to avoid contaminating the negative samples with speech.
-    
+
     Args:
         root_dir: Root directory where dataset is extracted
         split_name: Which split to use ('train', 'val', or 'test')
@@ -428,7 +438,7 @@ def process_esc50(
         target_folds = ["4"]
     else:  # test
         target_folds = ["5"]
-    
+
     # Define all human-related sound categories to exclude
     human_categories = [
         "20",  # crying_baby
@@ -442,39 +452,43 @@ def process_esc50(
         "28",  # snoring
         "29",  # drinking_sipping
     ]
-    
+
     # Filter files by fold and exclude human sounds
     noise_files = []
     excluded_human = 0
     excluded_fold = 0
-    
+
     for file in all_files:
         # ESC-50 filename format: {FOLD}-{CLIP_ID}-{TAKE}-{TARGET}.wav
         parts = file.stem.split("-")
-        
+
         if len(parts) < 4:
             logger.warning(f"Unexpected filename format: {file.name}")
             continue
-            
+
         fold = parts[0]
         target = parts[3]  # Category/class is in the 4th position (index 3)
-        
+
         # First check if this file belongs to the right fold
         if fold not in target_folds:
             excluded_fold += 1
             continue
-            
+
         # Then check if this is a human-related sound
         if target in human_categories:
             excluded_human += 1
             continue
-            
+
         # If it passes both checks, include it
         noise_files.append(file)
 
-    logger.info(f"Selected {len(noise_files)} ESC-50 audio files for {split_name} split")
-    logger.info(f"Excluded {excluded_human} human-related sounds and {excluded_fold} files from other folds")
-    
+    logger.info(
+        f"Selected {len(noise_files)} ESC-50 audio files for {split_name} split"
+    )
+    logger.info(
+        f"Excluded {excluded_human} human-related sounds and {excluded_fold} files from other folds"
+    )
+
     return noise_files
 
 
@@ -561,6 +575,7 @@ def create_overlapping_speech(
 
     return mix, vad_labels
 
+
 def process_musan(
     root_dir: pathlib.Path,
     split_name: str = "train",
@@ -568,62 +583,71 @@ def process_musan(
 ) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
     """
     Process MUSAN dataset with train/val/test splitting.
-    
+
     Args:
         root_dir: Root directory where MUSAN is extracted
         split_name: Which split to use ('train', 'val', or 'test')
         sample_rate: Target sample rate
-        
+
     Returns:
         Tuple of (speech_files, noise_files) for the requested split
     """
     musan_root = root_dir / "musan"
-    
+
     if not musan_root.exists():
         logger.warning(f"MUSAN directory not found at {musan_root}")
         return [], []
-    
+
     # Load all files
     all_speech_files = list(musan_root.joinpath("speech").rglob("*.wav"))
     all_noise_files = list(musan_root.joinpath("noise").rglob("*.wav"))
-    
-    logger.info(f"Found {len(all_speech_files)} MUSAN speech files and {len(all_noise_files)} noise files")
-    
+
+    logger.info(
+        f"Found {len(all_speech_files)} MUSAN speech files and {len(all_noise_files)} noise files"
+    )
+
     # Use deterministic shuffling for consistent splits
     random.seed(42)  # Fixed seed for reproducibility
-    
+
     # Shuffle both speech and noise files
     shuffled_speech = all_speech_files.copy()
     random.shuffle(shuffled_speech)
-    
+
     shuffled_noise = all_noise_files.copy()
     random.shuffle(shuffled_noise)
-    
+
     # Split: 70% train, 15% val, 15% test
     speech_train_idx = int(0.7 * len(shuffled_speech))
     speech_val_idx = int(0.85 * len(shuffled_speech))
-    
+
     noise_train_idx = int(0.7 * len(shuffled_noise))
     noise_val_idx = int(0.85 * len(shuffled_noise))
-    
+
     # Get the appropriate files based on split
     if split_name == "train":
         speech_files = shuffled_speech[:speech_train_idx]
         noise_files = shuffled_noise[:noise_train_idx]
-        logger.info(f"Using {len(speech_files)}/{len(all_speech_files)} speech files and "
-                   f"{len(noise_files)}/{len(all_noise_files)} noise files for training")
+        logger.info(
+            f"Using {len(speech_files)}/{len(all_speech_files)} speech files and "
+            f"{len(noise_files)}/{len(all_noise_files)} noise files for training"
+        )
     elif split_name == "val":
         speech_files = shuffled_speech[speech_train_idx:speech_val_idx]
         noise_files = shuffled_noise[noise_train_idx:noise_val_idx]
-        logger.info(f"Using {len(speech_files)}/{len(all_speech_files)} speech files and "
-                   f"{len(noise_files)}/{len(all_noise_files)} noise files for validation")
+        logger.info(
+            f"Using {len(speech_files)}/{len(all_speech_files)} speech files and "
+            f"{len(noise_files)}/{len(all_noise_files)} noise files for validation"
+        )
     else:  # test
         speech_files = shuffled_speech[speech_val_idx:]
         noise_files = shuffled_noise[noise_val_idx:]
-        logger.info(f"Using {len(speech_files)}/{len(all_speech_files)} speech files and "
-                   f"{len(noise_files)}/{len(all_noise_files)} noise files for testing")
-    
+        logger.info(
+            f"Using {len(speech_files)}/{len(all_speech_files)} speech files and "
+            f"{len(noise_files)}/{len(all_noise_files)} noise files for testing"
+        )
+
     return speech_files, noise_files
+
 
 def create_mixed_negative_sample(
     noise_files,
@@ -789,9 +813,10 @@ def create_negative_sample(
     hop_length,
     mix_ratio=0.5,
     category="music",
+    idx=None,  # Add index parameter to ensure variety
 ):
     """
-    Create a negative sample (noise, music, or mixed).
+    Create a negative sample (noise or music).
 
     Args:
         source_files: List of source audio files
@@ -799,24 +824,135 @@ def create_negative_sample(
         sample_rate: Audio sample rate
         win_length: Window length for frame analysis
         hop_length: Hop length for frame analysis
-        mix_ratio: Ratio for mixing second file
-        category: Type of negative sample ('noise', 'music', or 'mixed')
+        mix_ratio: Only used for 'mixed' category (deprecated)
+        category: Type of negative sample ('noise', 'music')
+        idx: Sample index for deterministic but varied file selection
+
+    Returns:
+        Tuple of (audio, VAD labels)
+    """
+    # Select a file deterministically if idx is provided
+    if idx is not None and len(source_files) > 0:
+        # Use modulo to cycle through all files
+        file_path = source_files[idx % len(source_files)]
+    else:
+        # Select a single source file randomly as fallback
+        file_path = random.choice(source_files)
+
+    # Load audio
+    audio = load_and_process_audio(file_path, sample_rate, duration)
+
+    # Ensure consistent length
+    target_length = int(duration * sample_rate)
+    audio = librosa.util.fix_length(audio, size=target_length)
+
+    # Optional: apply slight random gain variation to make the dataset more robust
+    gain_factor = random.uniform(0.8, 1.2)
+    audio = audio * gain_factor
+
+    # Create zero labels (non-speech)
+    n_frames = max(1, 1 + (len(audio) - win_length) // hop_length)
+    vad_labels = np.zeros(n_frames, dtype=np.float32)
+
+    # Normalize
+    audio = np.clip(audio, -1.0, 1.0)
+
+    return audio, vad_labels
+
+
+def create_noise_noise_sample(
+    noise_files,
+    duration,
+    sample_rate,
+    win_length,
+    hop_length,
+):
+    """
+    Create a negative sample by mixing two different noise sources.
+
+    Args:
+        noise_files: List of noise audio files
+        duration: Target duration in seconds
+        sample_rate: Audio sample rate
+        win_length: Window length for frame analysis
+        hop_length: Hop length for frame analysis
 
     Returns:
         Tuple of (mixed audio, VAD labels)
     """
-    # Select source files
-    file1, file2 = random.sample(source_files, 2)
+    # Select two different noise files
+    if len(noise_files) < 2:
+        # Fallback if we don't have enough files
+        noise_file = random.choice(noise_files)
+        noise1 = load_and_process_audio(noise_file, sample_rate, duration)
+        noise2 = noise1.copy()
+    else:
+        noise_file1, noise_file2 = random.sample(noise_files, 2)
+        noise1 = load_and_process_audio(noise_file1, sample_rate, duration)
+        noise2 = load_and_process_audio(noise_file2, sample_rate, duration)
 
-    # Load audio
-    audio1 = load_and_process_audio(file1, sample_rate, duration)
-    audio2 = load_and_process_audio(file2, sample_rate, duration)
-
-    # Mix with the specified ratio
+    # Ensure consistent length
     target_length = int(duration * sample_rate)
-    audio1 = librosa.util.fix_length(audio1, size=target_length)
-    audio2 = librosa.util.fix_length(audio2, size=target_length)
-    mix = audio1 + mix_ratio * audio2
+    noise1 = librosa.util.fix_length(noise1, size=target_length)
+    noise2 = librosa.util.fix_length(noise2, size=target_length)
+
+    # Mix with random ratio
+    mix_ratio = random.uniform(0.3, 0.7)
+    mix = noise1 + mix_ratio * noise2
+
+    # Create zero labels (non-speech)
+    n_frames = max(1, 1 + (len(mix) - win_length) // hop_length)
+    vad_labels = np.zeros(n_frames, dtype=np.float32)
+
+    # Normalize
+    mix = np.clip(mix, -1.0, 1.0)
+
+    return mix, vad_labels
+
+
+def create_music_music_sample(
+    music_files,
+    duration,
+    sample_rate,
+    win_length,
+    hop_length,
+):
+    """
+    Create a negative sample by mixing two different music sources.
+
+    Args:
+        music_files: List of music audio files
+        duration: Target duration in seconds
+        sample_rate: Audio sample rate
+        win_length: Window length for frame analysis
+        hop_length: Hop length for frame analysis
+
+    Returns:
+        Tuple of (mixed audio, VAD labels)
+    """
+    # Select two different music files
+    if len(music_files) < 2:
+        # Fallback if we don't have enough files
+        music_file = random.choice(music_files)
+        music1 = load_and_process_audio(music_file, sample_rate, duration)
+        music2 = music1.copy()
+    else:
+        music_file1, music_file2 = random.sample(music_files, 2)
+        music1 = load_and_process_audio(music_file1, sample_rate, duration)
+        music2 = load_and_process_audio(music_file2, sample_rate, duration)
+
+    # Ensure consistent length
+    target_length = int(duration * sample_rate)
+    music1 = librosa.util.fix_length(music1, size=target_length)
+    music2 = librosa.util.fix_length(music2, size=target_length)
+
+    # Apply different EQ to one of the tracks to create more variation
+    if random.random() > 0.5:
+        music2 = apply_eq(music2, sample_rate)
+
+    # Mix with random ratio
+    mix_ratio = random.uniform(0.3, 0.7)
+    mix = music1 + mix_ratio * music2
 
     # Create zero labels (non-speech)
     n_frames = max(1, 1 + (len(mix) - win_length) // hop_length)
@@ -1280,26 +1416,25 @@ def create_clean_speech_sample(
 
 
 def process_musdb(
-    root_dir: pathlib.Path, 
+    root_dir: pathlib.Path,
     split_name: str = "train",
     sample_rate: int = 16000,
 ) -> list[pathlib.Path]:
     """
-    Process MUSDB18HQ dataset from direct Zenodo download.
-    Returns paths to WAV files with vocals and mixtures excluded.
-    
+    Process MUSDB18HQ dataset and combine bass, drums, and other tracks into a single instrumental WAV file.
+
     Args:
         root_dir: Root directory where dataset should be stored
         split_name: Which split to use ('train', 'val', or 'test')
         sample_rate: Target sample rate
-        
+
     Returns:
-        List of paths to non-vocal, non-mixture audio files
+        List of paths to combined instrumental audio files
     """
     # Create musdb18hq directory if it doesn't exist
     musdb_root = root_dir / "musdb18hq"
     musdb_root.mkdir(parents=True, exist_ok=True)
-    
+
     # First, download and extract the dataset if needed
     try:
         # Download and extract the zip file
@@ -1307,64 +1442,105 @@ def process_musdb(
         logger.info(f"MUSDB18HQ dataset downloaded and extracted successfully")
     except Exception as e:
         logger.error(f"Error downloading/extracting MUSDB18HQ dataset: {e}")
-    
+
     # Initialize the list to store file paths
     music_files = []
-    
-    # MUSDB18HQ structure is: train/song_title/wav/ and test/song_title/wav/
+
+    # MUSDB18HQ structure is: train/song_title/ and test/song_title/
     if split_name in ["train", "val"]:
         search_dir = musdb_root / "train"
     else:  # test
         search_dir = musdb_root / "test"
-    
-    logger.info(f"Looking for MUSDB18HQ files in {search_dir}")
-    
-    # Find all WAV files, excluding vocals and mixtures
-    if search_dir.exists():
-        # Get all WAV files recursively
-        all_wav_files = list(search_dir.rglob("*.wav"))
-        logger.info(f"Found {len(all_wav_files)} total WAV files in {search_dir}")
-        
-        # Filter out vocals and mixtures (case-insensitive)
-        filtered_files = [
-            f for f in all_wav_files 
-            if "vocal" not in str(f).lower() and "mixture" not in str(f).lower()
-        ]
-        
-        logger.info(f"After filtering vocals and mixtures: {len(filtered_files)} files")
-        
-        # For train/val, split the files from the train folder
-        if split_name in ["train", "val"]:
-            # Use deterministic shuffling for consistent splits
-            random.seed(42)  # Fixed seed for reproducibility
-            random.shuffle(filtered_files)
-            
-            # Split: 80% for train, 20% for validation
-            split_idx = int(0.8 * len(filtered_files))
-            
-            if split_name == "train":
-                music_files = filtered_files[:split_idx]
-            else:  # val
-                music_files = filtered_files[split_idx:]
-                
-            logger.info(f"Using {len(music_files)}/{len(filtered_files)} files for {split_name}")
-        else:
-            # For test, use all files from the test folder
-            music_files = filtered_files
-            logger.info(f"Using {len(music_files)} files for test split")
-    
+
+    logger.info(f"Looking for MUSDB18HQ songs in {search_dir}")
+
+    # Find all song directories
+    song_dirs = [d for d in search_dir.iterdir() if d.is_dir()]
+    logger.info(f"Found {len(song_dirs)} song directories in {search_dir}")
+
+    # Process each song
+    for song_dir in tqdm(song_dirs, desc="Processing MUSDB songs"):
+        # Define paths for all stems
+        bass_path = song_dir / "bass.wav"
+        drums_path = song_dir / "drums.wav"
+        other_path = song_dir / "other.wav"
+
+        # Check if all required stems exist
+        if not (bass_path.exists() and drums_path.exists() and other_path.exists()):
+            logger.warning(f"Missing stems for {song_dir.name}, skipping")
+            continue
+
+        # Define output file path - maintain existing directory structure
+        output_path = song_dir / "instrumental.wav"
+
+        # Skip if the combined file already exists
+        if output_path.exists():
+            logger.info(
+                f"Combined file already exists for {song_dir.name}, skipping generation"
+            )
+            music_files.append(output_path)
+            continue
+
+        # Load all stems
+        try:
+            bass, sr_bass = librosa.load(bass_path, sr=sample_rate, mono=True)
+            drums, sr_drums = librosa.load(drums_path, sr=sample_rate, mono=True)
+            other, sr_other = librosa.load(other_path, sr=sample_rate, mono=True)
+
+            # Make sure all stems have the same length
+            max_length = max(len(bass), len(drums), len(other))
+            bass = librosa.util.fix_length(bass, size=max_length)
+            drums = librosa.util.fix_length(drums, size=max_length)
+            other = librosa.util.fix_length(other, size=max_length)
+
+            # Mix stems together
+            combined = bass + drums + other
+
+            # Normalize to prevent clipping
+            combined = combined / (np.max(np.abs(combined)) + 1e-7)
+
+            # Save combined track
+            sf.write(output_path, combined, sample_rate)
+
+            logger.info(f"Created combined instrumental track for {song_dir.name}")
+            music_files.append(output_path)
+
+        except Exception as e:
+            logger.error(f"Error processing {song_dir.name}: {e}")
+
+    # For train/val, split the files from the train folder
+    if split_name in ["train", "val"]:
+        # Use deterministic shuffling for consistent splits
+        random.seed(42)  # Fixed seed for reproducibility
+        random.shuffle(music_files)
+
+        # Split: 80% for train, 20% for validation
+        split_idx = int(0.8 * len(music_files))
+
+        if split_name == "train":
+            music_files = music_files[:split_idx]
+        else:  # val
+            music_files = music_files[split_idx:]
+
+        logger.info(f"Using {len(music_files)} files for {split_name}")
+
     # Create fallback if no files found
     if not music_files:
-        logger.warning(f"No suitable MUSDB18HQ audio files found. Creating fallback audio.")
-        fallback_path = musdb_root / f"fallback_audio_{split_name}_{sample_rate//1000}k.wav"
-        
+        logger.warning(
+            f"No suitable MUSDB18HQ audio files found. Creating fallback audio."
+        )
+        fallback_path = (
+            musdb_root / f"fallback_audio_{split_name}_{sample_rate//1000}k.wav"
+        )
+
         # Create silent audio
         fallback_audio = np.zeros(sample_rate * 10)  # 10 seconds of silence
         sf.write(fallback_path, fallback_audio, sample_rate)
         music_files = [fallback_path]
         logger.info(f"Created fallback audio file at {fallback_path}")
-    
+
     return music_files
+
 
 def create_speech_music_sample_with_silero(
     speech_files, music_files, duration, sample_rate, win_length, hop_length, vad_model
@@ -1475,6 +1651,150 @@ def create_overlapping_speech_with_silero(
     return mix, vad_labels
 
 
+def create_speech_noise_music_sample_with_silero(
+    speech_files,
+    noise_files,
+    music_files,
+    duration,
+    sample_rate,
+    win_length,
+    hop_length,
+    vad_model,
+):
+    """
+    Create a sample with speech + background noise + music using Silero VAD for labels.
+
+    Args:
+        speech_files: List of speech audio files
+        noise_files: List of noise audio files
+        music_files: List of music audio files
+        duration: Target duration in seconds
+        sample_rate: Audio sample rate
+        win_length: Window length for frame analysis
+        hop_length: Hop length for frame analysis
+        vad_model: Tuple of (model, utils) for Silero VAD
+
+    Returns:
+        Tuple of (mixed audio, VAD labels)
+    """
+    model, utils = vad_model
+
+    # Select source files
+    speech_path = random.choice(speech_files)
+    noise_path = random.choice(noise_files)
+    music_path = random.choice(music_files)
+
+    # Load audio
+    speech = load_and_process_audio(speech_path, sample_rate, duration)
+    noise = load_and_process_audio(noise_path, sample_rate, duration)
+    music = load_and_process_audio(music_path, sample_rate, duration)
+
+    # Ensure same length
+    target_length = int(duration * sample_rate)
+    speech = librosa.util.fix_length(speech, size=target_length)
+    noise = librosa.util.fix_length(noise, size=target_length)
+    music = librosa.util.fix_length(music, size=target_length)
+
+    # Mix with varying SNRs
+    # Speech-to-noise ratio
+    speech_noise_snr = random.uniform(-5, 20)
+    noise_scaling = (
+        10 ** (-speech_noise_snr / 20) * np.std(speech) / (np.std(noise) + 1e-7)
+    )
+
+    # Speech-to-music ratio (typically higher for better intelligibility)
+    speech_music_snr = random.uniform(5, 25)
+    music_scaling = (
+        10 ** (-speech_music_snr / 20) * np.std(speech) / (np.std(music) + 1e-7)
+    )
+
+    # Create the mixture
+    mix = speech + noise_scaling * noise + music_scaling * music
+    mix = np.clip(mix, -1.0, 1.0)  # Normalize
+
+    # Generate labels using Silero VAD
+    vad_labels = generate_silero_vad_labels(
+        mix,
+        sample_rate,
+        model,
+        hop_length=hop_length,
+        win_length=win_length,
+        utils=utils,
+    )
+
+    return mix, vad_labels
+
+
+def create_speech_noise_music_sample(
+    speech_files,
+    noise_files,
+    music_files,
+    duration,
+    sample_rate,
+    win_length,
+    hop_length,
+):
+    """
+    Create a sample with speech + background noise + music at varying SNRs.
+
+    Args:
+        speech_files: List of speech audio files
+        noise_files: List of noise audio files
+        music_files: List of music audio files
+        duration: Target duration in seconds
+        sample_rate: Audio sample rate
+        win_length: Window length for frame analysis
+        hop_length: Hop length for frame analysis
+
+    Returns:
+        Tuple of (mixed audio, VAD labels)
+    """
+    # Select source files
+    speech_path = random.choice(speech_files)
+    noise_path = random.choice(noise_files)
+    music_path = random.choice(music_files)
+
+    # Load audio
+    speech = load_and_process_audio(speech_path, sample_rate, duration)
+    noise = load_and_process_audio(noise_path, sample_rate, duration)
+    music = load_and_process_audio(music_path, sample_rate, duration)
+
+    # Ensure same length
+    target_length = int(duration * sample_rate)
+    speech = librosa.util.fix_length(speech, size=target_length)
+    noise = librosa.util.fix_length(noise, size=target_length)
+    music = librosa.util.fix_length(music, size=target_length)
+
+    # Create labels from clean speech (before mixing)
+    frame_energies = librosa.feature.rms(
+        y=speech, frame_length=win_length, hop_length=hop_length
+    )[0]
+
+    threshold = adaptive_energy_threshold(frame_energies)
+    vad_labels = (frame_energies > threshold).astype(np.float32)
+
+    # Mix with varying SNRs
+    # Speech-to-noise ratio
+    speech_noise_snr = random.uniform(-5, 20)
+    noise_scaling = (
+        10 ** (-speech_noise_snr / 20) * np.std(speech) / (np.std(noise) + 1e-7)
+    )
+
+    # Speech-to-music ratio (typically higher for better intelligibility)
+    speech_music_snr = random.uniform(5, 25)
+    music_scaling = (
+        10 ** (-speech_music_snr / 20) * np.std(speech) / (np.std(music) + 1e-7)
+    )
+
+    # Create the mixture
+    mix = speech + noise_scaling * noise + music_scaling * music
+
+    # Normalize
+    mix = np.clip(mix, -1.0, 1.0)
+
+    return mix, vad_labels
+
+
 def make_pos_neg(
     libri_root: pathlib.Path,
     musan_root: pathlib.Path,
@@ -1491,9 +1811,11 @@ def make_pos_neg(
     fleurs_streaming=False,
     speech_dir=None,
     use_additional_datasets=True,  # Add this parameter
-    neg_noise_ratio=0.25,
-    neg_esc50_ratio=0.25,
+    neg_noise_ratio=0.30,
+    neg_esc50_ratio=0.20,
     neg_music_ratio=0.25,
+    neg_noise_noise_ratio=0.10,
+    neg_music_music_ratio=0.10,
     vad_model=None,
 ):
     """
@@ -1543,7 +1865,7 @@ def make_pos_neg(
     musan_speech, musan_noise = process_musan(
         musan_root.parent,  # The parent of musan_root (should be datasets/)
         split_name=split_name,
-        sample_rate=sample_rate
+        sample_rate=sample_rate,
     )
     # With this:
     # Swap MUSAN music for MUSDB HQ mixtures
@@ -1561,11 +1883,15 @@ def make_pos_neg(
     if use_additional_datasets:
         # Process ESC-50 for noise sources
         root_dir = out_pos.parent.parent
-        esc50_noise = process_esc50(root_dir=root_dir, split_name=split_name, sample_rate=sample_rate)
+        esc50_noise = process_esc50(
+            root_dir=root_dir, split_name=split_name, sample_rate=sample_rate
+        )
         logger.info(f"Added {len(esc50_noise)} ESC-50 noise files")
 
         # Process VocalSet for speech sources
-        vocalset_speech = process_vocalset(root_dir=root_dir, split_name=split_name, sample_rate=sample_rate)
+        vocalset_speech = process_vocalset(
+            root_dir=root_dir, split_name=split_name, sample_rate=sample_rate
+        )
         logger.info(f"Added {len(vocalset_speech)} VocalSet speech files")
 
     # Combine noise sources
@@ -1691,17 +2017,63 @@ def make_pos_neg(
     hop_length = DEFAULT_HOP_LENGTH
     win_length = DEFAULT_WIN_LENGTH
 
-    # → POSITIVE SAMPLES (speech + noise) with enhanced augmentation
+    # Start with clean speech samples as base
+    logger.info(f"Generating {n_pos} clean speech samples...")
+    clean_speech_start_time = time.time()
+    generated_clean = 0
+    clean_speech_failures = 0
+
+    for idx in tqdm(range(n_pos), desc="Generating clean speech samples"):
+        duration = random.uniform(*duration_range)
+
+        if vad_model:
+            audio, vad_labels = create_clean_speech_sample_with_silero(
+                all_speech_files,
+                duration,
+                sample_rate,
+                win_length,
+                hop_length,
+                vad_model,
+            )
+        else:
+            audio, vad_labels = create_clean_speech_sample(
+                all_speech_files, duration, sample_rate, win_length, hop_length
+            )
+
+        # Validate before saving
+        if not validate_audio_sample(audio, sample_rate):
+            clean_speech_failures += 1
+            continue
+
+        # Save the validated sample
+        sf.write(out_pos / f"pos_clean_{idx:06}.wav", audio, sample_rate)
+        np.save(out_pos_labels / f"pos_clean_{idx:06}_labels.npy", vad_labels)
+        generated_clean += 1
+
+        # Stop when we've reached our target
+        if generated_clean >= n_pos:
+            break
+
+    clean_speech_time = time.time() - clean_speech_start_time
     logger.info(
-        "Generating positive samples (speech + noise) with enhanced augmentation..."
+        f"Completed {generated_clean} clean speech samples in {clean_speech_time:.2f}s "
+        f"({clean_speech_failures} failed validation)"
     )
 
-    start_time = time.time()
+    # Calculate other sample counts as percentages of clean speech samples
+    n_regular_samples = int(round(generated_clean * 0.30))  # Regular speech with noise
+    n_overlap_samples = int(round(generated_clean * 0.20))  # Overlapping speech
+    n_music_speech_samples = int(round(generated_clean * 0.25))  # Speech with music
+    n_snm_samples = int(round(generated_clean * 0.25))  # Speech with noise and music
+
+    # → REGULAR POSITIVE SAMPLES (speech + noise) with enhanced augmentation
+    logger.info(f"Generating {n_regular_samples} regular speech+noise samples...")
+    regular_start_time = time.time()
     generated_pos = 0
     failed_positives = 0
 
-    for idx, sp_path in enumerate(
-        tqdm(selected_speech, desc="Generating positive samples")
+    for idx in tqdm(
+        range(n_regular_samples), desc="Generating regular positive samples"
     ):
         # Random duration between duration_range
         duration = random.uniform(*duration_range)
@@ -1718,6 +2090,7 @@ def make_pos_neg(
             clean_speech = speech.copy()
         else:
             # ----- STEP 1: LOAD AUDIO -----
+            sp_path = random.choice(all_speech_files)
             full_speech, sr = librosa.load(sp_path, sr=sample_rate)
 
             # Apply random starting offset if audio is longer than needed
@@ -1823,6 +2196,10 @@ def make_pos_neg(
         alpha = 10 ** (-snr_db / 20) * np.std(speech) / (np.std(noise) + 1e-7)
         mix = speech + alpha * noise
 
+        if not validate_audio_sample(mix, sample_rate):
+            failed_positives += 1
+            continue
+
         # ----- STEP 6: SAVE THE SAMPLE -----
         # Determine source type and add descriptive tags
         source_type = "unknown"
@@ -1862,18 +2239,17 @@ def make_pos_neg(
     # Measure actual positive samples generated (safer approach)
     generated_pos = len(list(out_pos.glob("pos_*.wav")))
 
-    pos_time = time.time() - start_time
+    pos_time = time.time() - regular_start_time
     logger.info(
         f"Completed {generated_pos} positive samples in {pos_time:.2f}s ({pos_time/generated_pos:.3f}s per sample)"
     )
 
-    # → OVERLAPPING SPEECH SAMPLES (more challenging positives)
-    # Calculate sample count based on fixed percentage of actual positives
-    n_overlap_samples = int(round(generated_pos * 0.20))  # 20% of actual positives
-
-    # Replace the existing overlapping speech generation loop:
+    # → OVERLAPPING SPEECH SAMPLES
+    logger.info(f"Generating {n_overlap_samples} overlapping speech samples...")
+    overlap_start_time = time.time()
     overlap_generated = 0
     overlap_failures = 0
+
     if n_overlap_samples > 0:
         logger.info(f"Generating {n_overlap_samples} overlapping speech samples...")
         overlap_start_time = time.time()
@@ -1921,7 +2297,6 @@ def make_pos_neg(
         )
 
     # → SPEECH + MUSIC SAMPLES
-    n_music_speech_samples = int(round(generated_pos * 0.25))  # 25% of actual positives
     music_speech_generated = 0
     music_speech_failures = 0
 
@@ -1971,24 +2346,25 @@ def make_pos_neg(
             f"({music_speech_failures} failed validation)"
         )
 
-    # → CLEAN SPEECH SAMPLES (no added noise or effects)
-    n_clean_speech_samples = int(round(generated_pos * 0.15))  # 15% of actual positives
-    clean_speech_generated = 0
-    clean_speech_failures = 0
+    # → SPEECH + NOISE + MUSIC SAMPLES
+    snm_generated = 0
+    snm_failures = 0
 
-    if n_clean_speech_samples > 0:
-        logger.info(f"Generating {n_clean_speech_samples} clean speech samples...")
-        clean_speech_start_time = time.time()
+    if n_snm_samples > 0:
+        logger.info(f"Generating {n_snm_samples} speech+noise+music samples...")
+        snm_start_time = time.time()
 
         for idx in tqdm(
-            range(n_clean_speech_samples), desc="Generating clean speech samples"
+            range(n_snm_samples), desc="Generating speech+noise+music samples"
         ):
             duration = random.uniform(*duration_range)
 
+            # Use Silero VAD if available
             if vad_model:
-                # Use Silero-based functions
-                audio, vad_labels = create_clean_speech_sample_with_silero(
+                mix, vad_labels = create_speech_noise_music_sample_with_silero(
                     all_speech_files,
+                    all_noise_files,
+                    musdb_music,
                     duration,
                     sample_rate,
                     win_length,
@@ -1996,28 +2372,33 @@ def make_pos_neg(
                     vad_model,
                 )
             else:
-                # Use current energy-based method
-                audio, vad_labels = create_clean_speech_sample(
-                    all_speech_files, duration, sample_rate, win_length, hop_length
+                mix, vad_labels = create_speech_noise_music_sample(
+                    all_speech_files,
+                    all_noise_files,
+                    musdb_music,
+                    duration,
+                    sample_rate,
+                    win_length,
+                    hop_length,
                 )
 
             # Validate before saving
-            if not validate_audio_sample(audio, sample_rate):
-                clean_speech_failures += 1
+            if not validate_audio_sample(mix, sample_rate):
+                snm_failures += 1
                 continue
 
             # Save the validated sample
-            sf.write(out_pos / f"pos_clean_{idx:06}.wav", audio, sample_rate)
-            np.save(out_pos_labels / f"pos_clean_{idx:06}_labels.npy", vad_labels)
-            clean_speech_generated += 1
+            sf.write(out_pos / f"pos_snm_{idx:06}.wav", mix, sample_rate)
+            np.save(out_pos_labels / f"pos_snm_{idx:06}_labels.npy", vad_labels)
+            snm_generated += 1
 
-        clean_speech_time = time.time() - clean_speech_start_time
+        snm_time = time.time() - snm_start_time
         logger.info(
-            f"Completed {clean_speech_generated} clean speech samples in {clean_speech_time:.2f}s "
-            f"({clean_speech_failures} failed validation)"
+            f"Completed {snm_generated} speech+noise+music samples in {snm_time:.2f}s "
+            f"({snm_failures} failed validation)"
         )
 
-    # → NEGATIVE SAMPLES (noise only, music only, noise + music)
+    # → NEGATIVE SAMPLES (noise only, music only, noise + music, music + music)
     logger.info(
         "Generating negative samples with frame-level labels (noise only, music only, noise + music)..."
     )
@@ -2025,24 +2406,34 @@ def make_pos_neg(
 
     # Use the provided n_neg or match the total positive count
     actual_n_neg = n_neg or (
-        generated_pos
+        generated_clean  # Clean speech (base samples)
+        + generated_pos  # Regular speech + noise
         + overlap_generated
         + music_speech_generated
-        + clean_speech_generated
+        + snm_generated
     )
 
     # Compute per-type negative quotas once
     n_noise_only = int(round(actual_n_neg * neg_noise_ratio))
     n_esc50_only = int(round(actual_n_neg * neg_esc50_ratio))
     n_music_only = int(round(actual_n_neg * neg_music_ratio))
+    n_noise_noise = int(round(actual_n_neg * neg_noise_noise_ratio))  # New quota
+    n_music_music = int(round(actual_n_neg * neg_music_music_ratio))  # New quota
     n_mixed = (
-        actual_n_neg - n_noise_only - n_esc50_only - n_music_only
-    )  # remainder guard
+        actual_n_neg
+        - n_noise_only
+        - n_esc50_only
+        - n_music_only
+        - n_noise_noise
+        - n_music_music
+    )  # Update remainder guard
 
     logger.info(f"Target negative samples: {actual_n_neg} total")
     logger.info(f"  - Noise-only: {n_noise_only}")
     logger.info(f"  - ESC-50: {n_esc50_only}")
     logger.info(f"  - Music-only: {n_music_only}")
+    logger.info(f"  - Noise+noise: {n_noise_noise}")  # New log
+    logger.info(f"  - Music+music: {n_music_music}")  # New log
     logger.info(f"  - Mixed noise+music: {n_mixed}")
 
     # 1. NOISE ONLY samples
@@ -2052,7 +2443,7 @@ def make_pos_neg(
 
     for idx in tqdm(range(n_noise_only), desc="Generating noise-only samples"):
         duration = random.uniform(*duration_range)
-        mix, vad_labels = create_negative_sample(
+        audio, vad_labels = create_negative_sample(
             all_noise_files,
             duration,
             sample_rate,
@@ -2063,12 +2454,12 @@ def make_pos_neg(
         )
 
         # Validate before saving
-        if not validate_audio_sample(mix, sample_rate):
+        if not validate_audio_sample(audio, sample_rate):
             noise_only_failures += 1
             continue
 
         # Save the validated sample
-        sf.write(out_neg / f"neg_noise_{idx:06}.wav", mix, sample_rate)
+        sf.write(out_neg / f"neg_noise_{idx:06}.wav", audio, sample_rate)
         np.save(out_neg_labels / f"neg_noise_{idx:06}_labels.npy", vad_labels)
         noise_only_generated += 1
 
@@ -2121,7 +2512,7 @@ def make_pos_neg(
         duration = random.uniform(*duration_range)
 
         # Use our refactored function
-        mix, vad_labels = create_negative_sample(
+        audio, vad_labels = create_negative_sample(
             musdb_music,
             duration,
             sample_rate,
@@ -2132,12 +2523,12 @@ def make_pos_neg(
         )
 
         # Validate before saving
-        if not validate_audio_sample(mix, sample_rate):
+        if not validate_audio_sample(audio, sample_rate):
             music_only_failures += 1
             continue
 
         # Save the validated sample
-        sf.write(out_neg / f"neg_music_{idx:06}.wav", mix, sample_rate)
+        sf.write(out_neg / f"neg_music_{idx:06}.wav", audio, sample_rate)
         np.save(out_neg_labels / f"neg_music_{idx:06}_labels.npy", vad_labels)
         music_only_generated += 1
 
@@ -2177,6 +2568,64 @@ def make_pos_neg(
         f"Generated {mixed_generated} noise+music samples ({mixed_failures} failed validation)"
     )
 
+    # 5. NOISE + NOISE samples
+    logger.info(f"Generating {n_noise_noise} noise+noise samples")
+    noise_noise_generated = 0
+    noise_noise_failures = 0
+
+    for idx in tqdm(range(n_noise_noise), desc="Generating noise+noise samples"):
+        duration = random.uniform(*duration_range)
+        mix, vad_labels = create_noise_noise_sample(
+            all_noise_files,
+            duration,
+            sample_rate,
+            win_length,
+            hop_length,
+        )
+
+        # Validate before saving
+        if not validate_audio_sample(mix, sample_rate):
+            noise_noise_failures += 1
+            continue
+
+        # Save the validated sample
+        sf.write(out_neg / f"neg_noise_noise_{idx:06}.wav", mix, sample_rate)
+        np.save(out_neg_labels / f"neg_noise_noise_{idx:06}_labels.npy", vad_labels)
+        noise_noise_generated += 1
+
+    logger.info(
+        f"Generated {noise_noise_generated} noise+noise samples ({noise_noise_failures} failed validation)"
+    )
+
+    # 6. MUSIC + MUSIC samples
+    logger.info(f"Generating {n_music_music} music+music samples")
+    music_music_generated = 0
+    music_music_failures = 0
+
+    for idx in tqdm(range(n_music_music), desc="Generating music+music samples"):
+        duration = random.uniform(*duration_range)
+        mix, vad_labels = create_music_music_sample(
+            musdb_music,
+            duration,
+            sample_rate,
+            win_length,
+            hop_length,
+        )
+
+        # Validate before saving
+        if not validate_audio_sample(mix, sample_rate):
+            music_music_failures += 1
+            continue
+
+        # Save the validated sample
+        sf.write(out_neg / f"neg_music_music_{idx:06}.wav", mix, sample_rate)
+        np.save(out_neg_labels / f"neg_music_music_{idx:06}_labels.npy", vad_labels)
+        music_music_generated += 1
+
+    logger.info(
+        f"Generated {music_music_generated} music+music samples ({music_music_failures} failed validation)"
+    )
+
     neg_time = time.time() - start_time
     logger.info(
         f"Completed {actual_n_neg} negative samples in {neg_time:.2f}s ({neg_time/actual_n_neg:.3f}s per sample)"
@@ -2184,13 +2633,16 @@ def make_pos_neg(
 
     # ── FINAL SUMMARY ─────────────────────────────────────────────────
     summary = {
+        "positives_clean": generated_clean,
         "positives_regular": generated_pos,
         "positives_overlap": overlap_generated,
         "positives_music": music_speech_generated,
-        "positives_clean": clean_speech_generated,
+        "positives_snm": snm_generated,
         "neg_noise": noise_only_generated,
         "neg_esc50": esc50_generated,
         "neg_music": music_only_generated,
+        "neg_noise_noise": noise_noise_generated,  # New metric
+        "neg_music_music": music_music_generated,  # New metric
         "neg_mixed": mixed_generated,
     }
 
@@ -2200,9 +2652,12 @@ def make_pos_neg(
         + overlap_failures
         + music_speech_failures
         + clean_speech_failures
+        + snm_failures
         + noise_only_failures
         + esc50_failures
         + music_only_failures
+        + noise_noise_failures  # New failure count
+        + music_music_failures  # New failure count
         + mixed_failures
     )
 
@@ -2244,7 +2699,6 @@ def create_manifest(
             label_dir = "pos_labels" if is_speech else "neg_labels"
             frame_label_path = prep_dir / label_dir / f"{p.stem}_labels.npy"
 
-
             w.writerow([p, 1 if is_speech else 0, frame_label_path])
 
     logger.info(f"Created {split_name} manifest with {len(all_clips)} entries")
@@ -2263,9 +2717,11 @@ def prepare_dataset(
     fleurs_langs: str = None,
     fleurs_streaming: bool = False,
     use_additional_datasets: bool = True,  # Add this parameter
-    neg_noise_ratio=0.25,
-    neg_esc50_ratio=0.25,
+    neg_noise_ratio=0.30,
+    neg_esc50_ratio=0.20,
     neg_music_ratio=0.25,
+    neg_noise_noise_ratio=0.10,
+    neg_music_music_ratio=0.10,
     use_silero_vad: bool = True,
 ):
     """
@@ -2482,13 +2938,13 @@ def main(args=None):
         parser.add_argument(
             "--fraction_fleurs",
             type=float,
-            default=0.50,
+            default=0.20,
             help="Fraction of positive samples from FLEURS",
         )
         parser.add_argument(
             "--fraction_libri",
             type=float,
-            default=0.30,
+            default=0.60,
             help="Fraction of positive samples from LibriSpeech",
         )
         parser.add_argument(
@@ -2506,13 +2962,13 @@ def main(args=None):
         parser.add_argument(
             "--neg_noise_ratio",
             type=float,
-            default=0.25,
+            default=0.30,
             help="Fraction of negative samples that are pure noise",
         )
         parser.add_argument(
             "--neg_esc50_ratio",
             type=float,
-            default=0.25,
+            default=0.20,
             help="Fraction of negative samples that are ESC-50 sounds",
         )
         parser.add_argument(
@@ -2520,6 +2976,18 @@ def main(args=None):
             type=float,
             default=0.25,
             help="Fraction of negative samples that are music",
+        )
+        parser.add_argument(
+            "--neg_noise_noise_ratio",
+            type=float,
+            default=0.1,
+            help="Fraction of negative samples that are noise+noise combinations",
+        )
+        parser.add_argument(
+            "--neg_music_music_ratio",
+            type=float,
+            default=0.1,
+            help="Fraction of negative samples that are music+music combinations",
         )
         parser.add_argument(
             "--use_silero_vad",
@@ -2585,13 +3053,23 @@ def main(args=None):
                 else True
             ),
             neg_noise_ratio=(
-                args.neg_noise_ratio if hasattr(args, "neg_noise_ratio") else 0.25
+                args.neg_noise_ratio if hasattr(args, "neg_noise_ratio") else 0.30
             ),
             neg_esc50_ratio=(
-                args.neg_esc50_ratio if hasattr(args, "neg_esc50_ratio") else 0.25
+                args.neg_esc50_ratio if hasattr(args, "neg_esc50_ratio") else 0.20
             ),
             neg_music_ratio=(
                 args.neg_music_ratio if hasattr(args, "neg_music_ratio") else 0.25
+            ),
+            neg_noise_noise_ratio=(
+                args.neg_noise_noise_ratio
+                if hasattr(args, "neg_noise_noise_ratio")
+                else 0.10
+            ),
+            neg_music_music_ratio=(
+                args.neg_music_music_ratio
+                if hasattr(args, "neg_music_music_ratio")
+                else 0.10
             ),
             use_silero_vad=(
                 args.use_silero_vad if hasattr(args, "use_silero_vad") else False
