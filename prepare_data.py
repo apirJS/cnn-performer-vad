@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # URL constants
-TRAIN_LIBRISPEECH_URL = "https://www.openslr.org/resources/12/train-clean-360.tar.gz"
+TRAIN_LIBRISPEECH_URL = "https://www.openslr.org/resources/12/train-clean-100.tar.gz"
 VAL_LIBRISPEECH_URL = "https://www.openslr.org/resources/12/dev-clean.tar.gz"
 TEST_CLEAN_URL = "https://www.openslr.org/resources/12/test-clean.tar.gz"
 MUSAN_URL = "https://www.openslr.org/resources/17/musan.tar.gz"
@@ -125,6 +125,13 @@ def process_urbansound8k(
         import pandas as pd
         metadata = pd.read_csv(metadata_path)
         
+        # Debug: Print column names to debug the issue
+        logger.info(f"UrbanSound8K metadata columns: {list(metadata.columns)}")
+        
+        # Use the correct column names as specified in the README
+        # Looking for 'classID' instead of 'class_id'
+        class_id_col = 'classID' 
+        
         # Define human-related classes to exclude (children_playing)
         human_class_ids = [2]  # class ID for "children_playing"
         
@@ -139,7 +146,7 @@ def process_urbansound8k(
         # Filter metadata to get files for this split
         split_files = metadata[
             (metadata['fold'].isin(target_folds)) & 
-            (~metadata['class_id'].isin(human_class_ids))
+            (~metadata[class_id_col].isin(human_class_ids))
         ]
         
         # Build full paths to audio files
@@ -161,7 +168,7 @@ def process_urbansound8k(
                 logger.warning(f"Audio file not found: {file_path}")
                 
         # Count excluded files for logging
-        excluded_human = len(metadata[metadata['class_id'].isin(human_class_ids)])
+        excluded_human = len(metadata[metadata[class_id_col].isin(human_class_ids)])
         excluded_fold = len(metadata[~metadata['fold'].isin(target_folds)])
         
         logger.info(f"Selected {len(noise_files)} UrbanSound8K audio files for {split_name} split")
@@ -171,7 +178,11 @@ def process_urbansound8k(
         
     except Exception as e:
         logger.error(f"Error processing UrbanSound8K metadata: {e}")
+        # Add traceback for more detailed error info
+        import traceback
+        logger.error(traceback.format_exc())
         return []
+
 
 def initialize_silero_vad(
     model_path: Optional[str] = None, force_reload: bool = False, device: str = None
@@ -1384,28 +1395,46 @@ def apply_eq(audio, sr):
 
     # Apply 2-3 random frequency adjustments
     for _ in range(random.randint(2, 3)):
-        # Calculate Nyquist frequency
-        nyquist = sr / 2
-        
-        # Random center frequency (ensuring it's below Nyquist)
-        max_freq = min(7000, nyquist * 0.95)  # Cap at 7kHz or 95% of Nyquist
-        center_freq = random.uniform(100, max_freq)
-        
-        # Normalize frequency to range (0, 1)
-        w0 = center_freq / nyquist
-        
-        # Safety check to ensure w0 is strictly between 0 and 1
-        w0 = max(0.001, min(0.999, w0))
-        
-        q = random.uniform(0.5, 5.0)
-        gain_db = random.uniform(-10, 10)  # dB
+        try:
+            # Calculate Nyquist frequency
+            nyquist = sr / 2
+            
+            # More conservative range for center frequency
+            min_freq = 200  # Increased from 100
+            max_freq = min(6000, nyquist * 0.9)  # More restrictive cap
+            
+            # Ensure we have a valid frequency range
+            if min_freq >= max_freq:
+                continue  # Skip this iteration
+                
+            center_freq = random.uniform(min_freq, max_freq)
+            
+            # Normalize frequency to range (0, 1) with stricter bounds
+            w0 = center_freq / nyquist
+            
+            # Much stricter safety bounds
+            w0 = max(0.01, min(0.99, w0))
+            
+            # Double-check validity before proceeding
+            if w0 <= 0 or w0 >= 1:
+                continue  # Skip if invalid despite our checks
+            
+            # More conservative Q and gain values
+            q = random.uniform(0.8, 4.0)
+            gain_db = random.uniform(-8, 8)  # Reduced from -10,10
 
-        # Create and apply peaking filter
-        b, a = signal.iirpeak(w0, q, gain_db)
-        eq_audio = signal.lfilter(b, a, eq_audio)
+            # Create and apply peaking filter with error handling
+            b, a = signal.iirpeak(w0, q, gain_db)
+            eq_audio = signal.lfilter(b, a, eq_audio)
+            
+        except Exception as e:
+            # Gracefully handle any errors without stopping the whole process
+            continue  # Skip this filter and continue
 
     # Normalize output to prevent level blow-up
-    eq_audio = eq_audio / (np.max(np.abs(eq_audio)) + 1e-7)
+    max_val = np.max(np.abs(eq_audio))
+    if max_val > 0:  # Avoid division by zero
+        eq_audio = eq_audio / (max_val + 1e-7)
 
     return eq_audio
 
@@ -3395,7 +3424,7 @@ def prepare_dataset(
             download_and_extract_zip(VOCALSET_URL, root)
             download_and_extract_urbansound8k(URBANSOUND8K_URL, root)
         else:  # train split
-            # For training, we need train-clean-360
+            # For training, we need train-clean-100
             download_and_extract(TRAIN_LIBRISPEECH_URL, root)
             download_and_extract(MUSAN_URL, root)
             download_and_extract_zip(ESC_50_URL, root)
@@ -3415,7 +3444,7 @@ def prepare_dataset(
         elif split == "val":
             libri_root = root / "LibriSpeech" / "dev-clean"
         else:  # train split
-            libri_root = root / "LibriSpeech" / "train-clean-360"
+            libri_root = root / "LibriSpeech" / "train-clean-100"
 
         musan_root = root / "musan"
         prep = root / "prepared" / split
@@ -3670,7 +3699,7 @@ def main(args=None):
                 args.use_silero_vad if hasattr(args, "use_silero_vad") else False
             ),
         )
-        print(f"✅ Created manifest: {manifest_path}")
+        print(f"Created manifest: {manifest_path}")
 
 
 if __name__ == "__main__":
