@@ -171,21 +171,23 @@ class VADLightning(pl.LightningModule):
         # Convert dictionary to object-like access if needed
         if isinstance(hp, dict):
             from types import SimpleNamespace
+
             hp = SimpleNamespace(**hp)
-            
+
         # Log hyperparameters
-        logger.info(f"Initializing frame-level VADLightning with hyperparameters: {hp.__dict__ if hasattr(hp, '__dict__') else hp}")
-        
+        logger.info(
+            f"Initializing frame-level VADLightning with hyperparameters: {hp.__dict__ if hasattr(hp, '__dict__') else hp}"
+        )
+
         # Store hyperparameters to enable checkpoint loading
-        self.save_hyperparameters(hp.__dict__ if hasattr(hp, '__dict__') else hp)
-        
+        self.save_hyperparameters(hp.__dict__ if hasattr(hp, "__dict__") else hp)
+
         # Create model
         self.net = MelPerformer(
             hp.n_mels, hp.dim, hp.n_layers, hp.n_heads, max_seq_len=hp.max_frames
         )
 
-        # Use the pos_weight parameter as the alpha value in FocalLoss
-        self.loss = FocalLoss(alpha=hp.pos_weight, gamma=2.0)
+        self.loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(hp.pos_weight))
 
         self.train_f1 = F1Score(task="binary")
         self.val_f1 = F1Score(task="binary")
@@ -198,6 +200,15 @@ class VADLightning(pl.LightningModule):
 
     def _step(self, batch, tag):
         x, y, mask = batch  # Now includes mask for valid frames
+    
+        # Check if we received a completely empty/invalid batch
+        if not mask.any():
+            logger.warning(f"Received batch with no valid frames in {tag} step")
+            # Return a zero loss tensor that can be backpropagated
+            dummy_loss = torch.tensor(0.0, requires_grad=True, device=self.device)
+            self.log(f"{tag}_loss", dummy_loss, prog_bar=True, on_epoch=True)
+            return dummy_loss
+        
         logger.debug(
             f"{tag} step with batch shapes: x={x.shape}, y={y.shape}, mask={mask.shape}"
         )

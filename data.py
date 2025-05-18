@@ -23,7 +23,7 @@ from config import (
     DEFAULT_SAMPLE_RATE,
     DEFAULT_TIME_MASK_MAX,
     DEFAULT_FREQ_MASK_MAX,
-    DEFAULT_MAX_FRAMES
+    DEFAULT_MAX_FRAMES,
 )
 
 # Configure module logger
@@ -94,7 +94,7 @@ class CSVMelDataset(Dataset):
         """Set up and validate the cache directory if provided."""
         if not cache_dir:
             return None
-            
+
         cache_path = pathlib.Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)
         params_file = cache_path / "params.json"
@@ -109,9 +109,7 @@ class CSVMelDataset(Dataset):
                     import shutil
 
                     # Backup existing cache directory
-                    backup_dir = (
-                        cache_path.parent / f"{cache_path.name}_backup"
-                    )
+                    backup_dir = cache_path.parent / f"{cache_path.name}_backup"
                     if backup_dir.exists():
                         shutil.rmtree(backup_dir)
                     cache_path.rename(backup_dir)
@@ -165,8 +163,10 @@ class CSVMelDataset(Dataset):
                         return mel, frame_labels
 
                 # Load and process audio file
-                mel, frame_labels = self._process_audio_file(path, clip_label, label_path)
-                
+                mel, frame_labels = self._process_audio_file(
+                    path, clip_label, label_path
+                )
+
                 # Cache result if enabled
                 if self.cache_dir:
                     logger.debug(f"Caching data for {path.stem}")
@@ -196,8 +196,19 @@ class CSVMelDataset(Dataset):
     def _process_audio_file(self, path, clip_label, label_path):
         """Process an audio file to generate mel spectrogram and labels."""
         # Load and process audio
-        logger.debug(f"Processing audio file: {path}")
-        wav, sr = torchaudio.load(path)  # (1, T)
+        try:
+            wav, sr = torchaudio.load(path)
+        except Exception as e:
+            # Fallback to librosa if torchaudio fails
+            logger.warning(f"Torchaudio failed, trying librosa: {e}")
+            try:
+                import librosa
+
+                y, sr = librosa.load(str(path), sr=self.sample_rate)
+                wav = torch.from_numpy(y).unsqueeze(0)
+            except Exception as e2:
+                raise RuntimeError(f"Both loading methods failed: {e2}")
+
         if sr != self.sample_rate:
             logger.debug(f"Resampling from {sr}Hz to {self.sample_rate}Hz")
             wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
@@ -222,10 +233,8 @@ class CSVMelDataset(Dataset):
                 frame_labels = torch.cat([frame_labels, padding])
         else:
             # If no frame labels, use clip label for all frames
-            frame_labels = torch.full(
-                (mel.shape[0],), clip_label, dtype=torch.float32
-            )
-            
+            frame_labels = torch.full((mel.shape[0],), clip_label, dtype=torch.float32)
+
         return mel, frame_labels
 
     def spec_augment(self, mel_spectrogram: torch.Tensor) -> torch.Tensor:
@@ -258,7 +267,7 @@ def collate_pad(batch, max_frames=DEFAULT_MAX_FRAMES):
             logger.warning("Filtered out error sample in collate_fn")
             continue
         filtered_batch.append((x, y))
-    
+
     # If all samples were filtered out, return a minimal dummy batch
     if len(filtered_batch) == 0:
         logger.error("All samples in batch were invalid!")
@@ -269,7 +278,7 @@ def collate_pad(batch, max_frames=DEFAULT_MAX_FRAMES):
         dummy_y = torch.zeros(batch_size, max_frames)
         dummy_mask = torch.zeros(batch_size, max_frames, dtype=torch.bool)
         return dummy_x, dummy_y, dummy_mask
-    
+
     # Process the filtered batch
     xs, ys = zip(*filtered_batch)
     n_mels = xs[0].shape[1]
@@ -298,7 +307,7 @@ def collate_pad(batch, max_frames=DEFAULT_MAX_FRAMES):
 
 class VADDataModule(pl.LightningDataModule):
     """PyTorch Lightning DataModule for VAD task."""
-    
+
     def __init__(
         self,
         train_dataset: Dataset,

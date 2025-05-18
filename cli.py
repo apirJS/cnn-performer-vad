@@ -87,7 +87,7 @@ def setup_prepare_parser(subparsers):
     parser.add_argument(
         "--neg_noise_ratio",
         type=float,
-        default=0.2,
+        default=0.1,
         help="Fraction of negative samples that are pure noise",
     )
     parser.add_argument(
@@ -101,6 +101,12 @@ def setup_prepare_parser(subparsers):
         type=float,
         default=0.2,
         help="Fraction of negative samples that are music",
+    )
+    parser.add_argument(
+        "--neg_music_noise_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of negative samples that are music + noise",
     )
     parser.add_argument(
         "--neg_noise_noise_ratio",
@@ -118,7 +124,7 @@ def setup_prepare_parser(subparsers):
         "--neg_urbansound_ratio",
         type=float,
         default=0.2,
-        help="Fraction of negative samples that are UrbanSound8K sounds"
+        help="Fraction of negative samples that are UrbanSound8K sounds",
     )
     parser.add_argument(
         "--use_silero_vad",
@@ -324,7 +330,9 @@ def main():
     elif args.command == "train":
         from train import main as train_main
 
-        train_main()
+        # Remove the 'command' attribute which train.py doesn't expect
+        delattr(args, "command")
+        train_main(args)  # Pass the parsed arguments
     elif args.command == "evaluate":
         from evaluation import main as evaluate_main
 
