@@ -95,37 +95,6 @@ def apply_eq(audio, sr):
     return eq_audio
 
 
-def download_and_extract_urbansound8k(url: str, dest: pathlib.Path):
-    """Download and extract the UrbanSound8K dataset if not already done."""
-    fname = dest / "urbansound8k.tar.gz"
-    if not fname.exists():
-        success = download_file(url, fname)
-        if not success:
-            logger.error(f"Failed to download UrbanSound8K dataset")
-            sys.exit(f"❌ Failed to download UrbanSound8K dataset")
-    else:
-        logger.info(f"UrbanSound8K archive already exists: {fname}, skipping download")
-
-    mark = dest / f".extracted_urbansound8k.tar.gz"
-    if not mark.exists():
-        logger.info(f"Extracting UrbanSound8K archive")
-        print(f"📦 Extracting urbansound8k.tar.gz")
-        import tarfile
-
-        try:
-            with tarfile.open(fname) as tar:
-                tar.extractall(path=dest)
-            mark.touch()
-            logger.info(f"UrbanSound8K extraction completed and marked with {mark}")
-        except Exception as e:
-            logger.error(f"Error extracting UrbanSound8K dataset: {e}")
-            sys.exit(f"❌ Error extracting UrbanSound8K dataset: {e}")
-    else:
-        logger.info(
-            f"UrbanSound8K archive already extracted (marker file exists): {mark}"
-        )
-
-
 def download_file(url, dest_path):
     """
     Cross-platform file download function that works on Windows and Unix systems.
@@ -166,36 +135,63 @@ def download_file(url, dest_path):
         return False
 
 
-def download_and_extract(url: str, dest: pathlib.Path):
-    """Download and extract a tar.gz archive if not already done."""
-    fname = dest / url.split("/")[-1]
+def download_and_extract(
+    url: str, dest: pathlib.Path, custom_filename: str = None, dataset_name: str = None
+):
+    """
+    Download and extract a tar.gz archive if not already done.
+
+    Args:
+        url: URL to download from
+        dest: Destination path
+        custom_filename: Override filename (otherwise derived from URL)
+        dataset_name: Name of dataset for error messages (defaults to filename)
+    """
+    if custom_filename:
+        fname = dest / custom_filename
+    else:
+        fname = dest / url.split("/")[-1]
+
+    dataset_name = dataset_name or fname.name
+
     if not fname.exists():
         success = download_file(url, fname)
         if not success:
-            logger.error(f"Failed to download {url}")
-            sys.exit(f"❌ Failed to download {url}")
+            logger.error(f"Failed to download {dataset_name}")
+            sys.exit(f"❌ Failed to download {dataset_name}")
     else:
-        logger.info(f"File already exists: {fname}, skipping download")
+        logger.info(
+            f"{dataset_name} archive already exists: {fname}, skipping download"
+        )
 
     mark = dest / f".extracted_{fname.name}"
     if not mark.exists():
-        logger.info(f"Extracting archive: {fname.name}")
+        logger.info(f"Extracting {dataset_name} archive")
         print(f"📦 Extracting {fname.name}")
         import tarfile
 
-        with tarfile.open(fname) as tar:
-            tar.extractall(path=dest)
-        mark.touch()
-        logger.info(f"Extraction completed and marked with {mark}")
+        try:
+            with tarfile.open(fname) as tar:
+                tar.extractall(path=dest)
+            mark.touch()
+            logger.info(f"{dataset_name} extraction completed and marked with {mark}")
+        except Exception as e:
+            logger.error(f"Error extracting {dataset_name}: {e}")
+            sys.exit(f"❌ Error extracting {dataset_name}: {e}")
     else:
-        logger.info(f"Archive already extracted (marker file exists): {mark}")
+        logger.info(
+            f"{dataset_name} archive already extracted (marker file exists): {mark}"
+        )
 
 
 def download_and_extract_zip(url: str, dest: pathlib.Path):
     """Download and extract a ZIP archive if not already done."""
-    fname = (
-        dest / url.split("/")[-1].split("?")[0]
-    )  # Handle Zenodo URLs with query params
+    url_filename = url.split("/")[-1]
+    if "?" in url_filename:
+        url_filename = url_filename.split("?")[0]
+
+    fname = dest / url_filename
+
     if not fname.exists():
         success = download_file(url, fname)
         if not success:
@@ -207,7 +203,6 @@ def download_and_extract_zip(url: str, dest: pathlib.Path):
     mark = dest / f".extracted_{fname.name}"
     if not mark.exists():
         logger.info(f"Extracting ZIP archive: {fname.name}")
-        print(f"📦 Extracting {fname.name}")
         import zipfile
 
         with zipfile.ZipFile(fname, "r") as zip_ref:
@@ -329,9 +324,6 @@ def stratified_fleurs_sample(fleurs_files, n_samples=10000):
 
     # If we have too many, trim
     return stratified_files[:n_samples]
-
-
-import numpy as np
 
 
 def merge_vad_labels(*label_arrays):

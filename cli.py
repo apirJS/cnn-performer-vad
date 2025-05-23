@@ -231,6 +231,33 @@ def setup_eval_parser(subparsers):
         default=DEFAULT_CACHE_DIR,
         help="Directory for cached mel spectrograms",
     )
+    
+    # Add boundary analysis parameters
+    parser.add_argument(
+        "--boundary_analysis",
+        action="store_true",
+        help="Perform detailed speech boundary detection analysis",
+    )
+    parser.add_argument(
+        "--transition_window",
+        type=int,
+        default=10,
+        help="Window size (frames) for transition analysis",
+    )
+    parser.add_argument(
+        "--two_stage_eval",
+        action="store_true",
+        help="Use separate validation set for threshold tuning",
+    )
+    parser.add_argument(
+        "--n_validation",
+        type=int,
+        default=500,
+        help="Number of validation samples for threshold tuning",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
 
     return parser
 
@@ -318,28 +345,40 @@ def main():
     setup_prepare_parser(subparsers)
     setup_train_parser(subparsers)
     setup_eval_parser(subparsers)
-    setup_inference_parser(subparsers)  # Add the new inference parser
+    setup_inference_parser(subparsers)
 
     # Parse arguments
     args = parser.parse_args()
 
     if args.command == "prepare":
         from prepare_data import main as prepare_main
-
         prepare_main(args)  # Pass the parsed arguments to prepare_main
     elif args.command == "train":
         from train import main as train_main
-
         # Remove the 'command' attribute which train.py doesn't expect
         delattr(args, "command")
         train_main(args)  # Pass the parsed arguments
     elif args.command == "evaluate":
+        # Convert CLI args to sys.argv format that evaluation.py expects
         from evaluation import main as evaluate_main
-
+        
+        # First clear sys.argv and add the script name
+        sys.argv = [sys.argv[0]]
+        
+        # Add all arguments
+        for arg_name, arg_value in vars(args).items():
+            if arg_name != 'command':  # Skip the command itself
+                if isinstance(arg_value, bool):
+                    if arg_value:
+                        sys.argv.append(f"--{arg_name}")
+                elif arg_value is not None:
+                    sys.argv.append(f"--{arg_name}")
+                    sys.argv.append(str(arg_value))
+        
+        # Now call the evaluation main function which will parse these args
         evaluate_main()
     elif args.command == "inference":
         from inference import main as inference_main
-
         return inference_main(args)  # Return the exit code from inference
     else:
         parser.print_help()

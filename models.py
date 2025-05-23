@@ -8,6 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchmetrics import F1Score, AUROC
+import torch.quantization
 
 from config import *
 
@@ -108,7 +109,6 @@ class MelPerformer(nn.Module):
         )
 
     def forward(self, x):  # x (B,T,n_mels)
-        logger.debug(f"Forward pass with input shape: {x.shape}")
         # Process with convolutional layers (transpose for conv1d)
         x = x.transpose(1, 2)  # (B,n_mels,T)
         x = self.conv_layers(x)  # (B,dim,T)
@@ -200,7 +200,7 @@ class VADLightning(pl.LightningModule):
 
     def _step(self, batch, tag):
         x, y, mask = batch  # Now includes mask for valid frames
-    
+
         # Check if we received a completely empty/invalid batch
         if not mask.any():
             logger.warning(f"Received batch with no valid frames in {tag} step")
@@ -208,7 +208,7 @@ class VADLightning(pl.LightningModule):
             dummy_loss = torch.tensor(0.0, requires_grad=True, device=self.device)
             self.log(f"{tag}_loss", dummy_loss, prog_bar=True, on_epoch=True)
             return dummy_loss
-        
+
         logger.debug(
             f"{tag} step with batch shapes: x={x.shape}, y={y.shape}, mask={mask.shape}"
         )
@@ -229,12 +229,12 @@ class VADLightning(pl.LightningModule):
 
         # Use stateful metrics with valid frames only
         if tag == "train":
-            self.train_f1(preds > 0.5, valid_targets.int())
+            self.train_f1(preds, valid_targets.int())
             self.train_auroc(preds, valid_targets.int())
             self.log("train_f1", self.train_f1, on_epoch=True)
             self.log("train_auroc", self.train_auroc, on_epoch=True)
         else:  # validation
-            self.val_f1(preds > 0.5, valid_targets.int())
+            self.val_f1(preds, valid_targets.int())
             self.val_auroc(preds, valid_targets.int())
             self.log("val_f1", self.val_f1, on_epoch=True)
             self.log("val_auroc", self.val_auroc, on_epoch=True)

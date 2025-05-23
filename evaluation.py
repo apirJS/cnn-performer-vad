@@ -21,6 +21,7 @@ from sklearn.metrics import (
 )
 
 from torch.utils.data import DataLoader
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 import argparse
 import csv
@@ -150,9 +151,9 @@ def evaluate_model(model_path, test_manifest, args):
     try:
         # First try standard loading
         model = VADLightning.load_from_checkpoint(model_path)
-    except AttributeError as e:
-        # If we get dictionary error, load with a workaround
-        logger.info("Standard loading failed, trying with hyperparameter conversion")
+    except (AttributeError, TypeError) as e:
+        # If we get dictionary error or missing argument error, load with a workaround
+        logger.info(f"Standard loading failed with error: {e}, trying with hyperparameter conversion")
 
         # Load the checkpoint directly
         checkpoint = torch.load(model_path, map_location=args.device)
@@ -529,6 +530,7 @@ def plot_metrics(
     # 2. Precision-Recall Curve
     logger.info("Plotting frame-level Precision-Recall curve")
     precision, recall, thresholds = precision_recall_curve(frame_labels, frame_preds)
+    thresholds = np.append(thresholds, 1.0)
     pr_auc = auc(recall, precision)
 
     plt.figure(figsize=(10, 8))
@@ -552,23 +554,13 @@ def plot_metrics(
     else:
         f1_scores = 2 * precision * recall / (precision + recall + 1e-10)
         optimal_idx = np.argmax(f1_scores)
-        optimal_threshold = (
-            thresholds[optimal_idx] if optimal_idx < len(thresholds) else 0.5
-        )
+        optimal_threshold = thresholds[optimal_idx]
+
         logger.info(f"Found optimal frame threshold: {optimal_threshold}")
 
     binary_preds = (frame_preds >= optimal_threshold).astype(int)
     cm = confusion_matrix(frame_labels, binary_preds)
-
-    # Calculate correct F1 score from confusion matrix elements
-    tn, fp, fn, tp = cm.ravel()
-    precision_from_cm = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall_from_cm = tp / (tp + fn) if (tp + fn) > 0 else 0
-    frame_f1 = (
-        2 * precision_from_cm * recall_from_cm / (precision_from_cm + recall_from_cm)
-        if (precision_from_cm + recall_from_cm) > 0
-        else 0
-    )
+    frame_f1 = f1_score(frame_labels, binary_preds)
 
     plt.figure(figsize=(10, 8))
     sns.heatmap(
@@ -622,12 +614,9 @@ def plot_metrics(
     recall_values = []
 
     for threshold in thresholds_for_plot:
-        binary_preds = (frame_preds >= threshold).astype(int)
-        tn, fp, fn, tp = confusion_matrix(frame_labels, binary_preds).ravel()
-
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0
-        rec = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+        prec = precision_score(frame_labels, binary_preds, zero_division=0)
+        rec = recall_score(frame_labels, binary_preds, zero_division=0)
+        f1 = f1_score(frame_labels, binary_preds)
 
         precision_values.append(prec)
         recall_values.append(rec)
@@ -680,6 +669,8 @@ def plot_metrics(
     clip_precision, clip_recall, clip_pr_thresholds = precision_recall_curve(
         clip_labels, clip_preds
     )
+    clip_pr_thresholds = np.append(clip_pr_thresholds, 1.0)
+
     clip_pr_auc = auc(clip_recall, clip_precision)
 
     plt.figure(figsize=(10, 8))
@@ -705,15 +696,12 @@ def plot_metrics(
             2 * clip_precision * clip_recall / (clip_precision + clip_recall + 1e-10)
         )
         clip_optimal_idx = np.argmax(clip_f1_scores)
-        clip_optimal_threshold = (
-            clip_pr_thresholds[clip_optimal_idx]
-            if clip_optimal_idx < len(clip_pr_thresholds)
-            else 0.5
-        )
+        clip_optimal_threshold = clip_pr_thresholds[clip_optimal_idx]
         logger.info(f"Found optimal clip threshold: {clip_optimal_threshold}")
 
     clip_binary_preds = (clip_preds >= clip_optimal_threshold).astype(int)
     clip_cm = confusion_matrix(clip_labels, clip_binary_preds)
+    clip_f1 = f1_score(clip_labels, clip_binary_preds)
 
     plt.figure(figsize=(10, 8))
     sns.heatmap(
@@ -768,8 +756,6 @@ def plot_metrics(
         "Clip PR-AUC",
         "Clip F1",
     ]
-
-    clip_f1 = f1_score(clip_labels, clip_binary_preds)
 
     metrics_values = [roc_auc, pr_auc, frame_f1, clip_roc_auc, clip_pr_auc, clip_f1]
 

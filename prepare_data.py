@@ -21,7 +21,6 @@ from typing import Dict, Tuple, Optional
 from utils import (
     download_and_extract,
     logger,
-    download_and_extract_urbansound8k,
     download_and_extract_zip,
     load_and_process_audio,
     apply_eq,
@@ -786,43 +785,6 @@ def create_mixed_negative_sample(
     return mix, vad_labels
 
 
-def generate_vad_labels(
-    audio, win_length, hop_length, threshold_percentile=0.3, smooth=True
-):
-    """
-    Generate VAD labels from audio using energy-based approach.
-
-    Args:
-        audio: Input audio array
-        win_length: Window length for frame analysis
-        hop_length: Hop length for frame analysis
-        threshold_percentile: Percentile for energy threshold
-        smooth: Whether to smooth labels with minimum segment constraint
-
-    Returns:
-        Frame-level VAD labels
-    """
-    # Calculate frame energies
-    frame_energies = librosa.feature.rms(
-        y=audio, frame_length=win_length, hop_length=hop_length
-    )[0]
-
-    # Determine threshold and create binary labels
-    sorted_energies = np.sort(frame_energies)
-    threshold_idx = int(len(sorted_energies) * threshold_percentile)
-    energy_threshold = sorted_energies[threshold_idx]
-    vad_labels = (frame_energies > energy_threshold).astype(np.float32)
-
-    # Apply smoothing if requested
-    if smooth:
-        min_speech_frames = 3  # About 50ms at 16kHz with default hop_length
-        for i in range(len(vad_labels) - min_speech_frames + 1):
-            if 0 < sum(vad_labels[i : i + min_speech_frames]) < min_speech_frames:
-                vad_labels[i : i + min_speech_frames] = 0
-
-    return vad_labels
-
-
 def create_negative_sample(
     source_files,
     duration,
@@ -1020,26 +982,30 @@ def validate_audio_sample(
 
     return True
 
-def validate_negative_audio_sample(audio, sr, min_duration_sec=1.0, hp_dc_threshold=0.02):
+
+def validate_negative_audio_sample(
+    audio, sr, min_duration_sec=1.0, hp_dc_threshold=0.02
+):
     """Less strict validation for negative samples."""
     # Duration check
     n_samples_min = int(min_duration_sec * sr)
     if len(audio) < n_samples_min:
         return False
-        
+
     # DC bias check (still important for all audio)
     if abs(np.mean(audio)) > hp_dc_threshold:
         return False
-        
+
     # Clipping check (still important for all audio)
     if np.sum(np.abs(audio) > 0.998) / len(audio) > 0.05:  # More permissive
         return False
-        
+
     # Absolute silence check (extremely low energy)
     if np.std(audio) < 1e-6:  # Much lower threshold
         return False
-        
+
     return True
+
 
 def ingest_fleurs(
     lang_list: list[str],
@@ -1080,7 +1046,7 @@ def ingest_fleurs(
 
         try:
             ds = load_dataset(
-                "google/fleurs",
+                "google/fleurs-r",
                 cfg,
                 split="validation" if split == "val" else split,
                 streaming=streaming,
@@ -1930,28 +1896,25 @@ def prepare_dataset(
         # Determine which datasets to download based on split
         if split == "test":
             pass
-            # For test, we need test-clean
             # download_and_extract(TEST_CLEAN_URL, root)
             # download_and_extract(MUSAN_URL, root)
+            # download_and_extract(URBANSOUND8K_URL, root, "urbansound8k.tar.gz", "UrbanSound8K")
             # download_and_extract_zip(ESC_50_URL, root)
             # download_and_extract_zip(VOCALSET_URL, root)
-            # download_and_extract_urbansound8k(URBANSOUND8K_URL, root)
         elif split == "val":
             pass
-            # For validation, we need dev-clean
             # download_and_extract(VAL_LIBRISPEECH_URL, root)
             # download_and_extract(MUSAN_URL, root)
+            # download_and_extract(URBANSOUND8K_URL, root, "urbansound8k.tar.gz", "UrbanSound8K")
             # download_and_extract_zip(ESC_50_URL, root)
             # download_and_extract_zip(VOCALSET_URL, root)
-            # download_and_extract_urbansound8k(URBANSOUND8K_URL, root)
         else:  # train split
             pass
-            # For training, we need train-clean-100
             # download_and_extract(TRAIN_LIBRISPEECH_URL, root)
             # download_and_extract(MUSAN_URL, root)
+            # download_and_extract(URBANSOUND8K_URL, root, "urbansound8k.tar.gz", "UrbanSound8K")
             # download_and_extract_zip(ESC_50_URL, root)
             # download_and_extract_zip(VOCALSET_URL, root)
-            # download_and_extract_urbansound8k(URBANSOUND8K_URL, root)
 
         state["downloads_complete"] = True
         with open(state_file, "w") as f:
@@ -2150,36 +2113,6 @@ def main(args=None):
 
     # Set seed for reproducibility
     seed_everything(args.seed)
-
-    # Replace the warning with this auto-adjustment code
-    neg_sum = (
-        args.neg_noise_ratio
-        + args.neg_esc50_ratio
-        + args.neg_music_ratio
-        + args.neg_noise_noise_ratio
-        + args.neg_music_music_ratio
-        + args.neg_urbansound_ratio
-    )
-    # if abs(neg_sum - 1.0) > 1e-6:  # If not approximately 1.0
-    #     logger.warning(
-    #         f"Negative sample ratios sum to {neg_sum}, which differs from 1.0. "
-    #         f"Auto-adjusting to ensure they sum to 1.0."
-    #     )
-    #     # Scale each ratio to make them sum to 1.0
-    #     scaling_factor = 1.0 / neg_sum
-    #     args.neg_noise_ratio *= scaling_factor
-    #     args.neg_esc50_ratio *= scaling_factor
-    #     args.neg_music_ratio *= scaling_factor
-    #     args.neg_noise_noise_ratio *= scaling_factor
-    #     args.neg_music_music_ratio *= scaling_factor
-    #     args.neg_urbansound_ratio *= scaling_factor
-    #     logger.info(
-    #         f"Adjusted ratios: noise={args.neg_noise_ratio:.3f}, "
-    #         f"esc50={args.neg_esc50_ratio:.3f}, music={args.neg_music_ratio:.3f}, "
-    #         f"noise_noise={args.neg_noise_noise_ratio:.3f}, "
-    #         f"music_music={args.neg_music_music_ratio:.3f}"
-    #         f"urbansound={args.neg_urbansound_ratio:.3f}"
-    #     )
 
     # Process each requested split
     for split in args.splits:

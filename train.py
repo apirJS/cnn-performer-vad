@@ -16,6 +16,7 @@ from pytorch_lightning.callbacks import (
     EarlyStopping,
 )
 from pytorch_lightning.loggers import TensorBoardLogger
+import os
 
 # Import from our modules
 from config import *
@@ -152,6 +153,17 @@ def build_parser():
         "--export_path",
         default=DEFAULT_MODEL_EXPORT_PATH,
         help="Path to save the exported model",
+    )
+    # In the build_parser() function, add these arguments:
+    p.add_argument(
+        "--export_onnx",
+        action="store_true",
+        help="Export the model to ONNX format for cross-platform deployment",
+    )
+    p.add_argument(
+        "--export_quantized",
+        action="store_true",
+        help="Export a quantized version of the model for edge deployment",
     )
 
     # training parameters
@@ -374,23 +386,167 @@ def setup_trainer(args, callbacks):
     return trainer
 
 
-def export_model(model_path, output_path):
-    """Export a trained model for inference."""
-    logger.info(f"Loading checkpoint from {model_path}")
-    model = VADLightning.load_from_checkpoint(model_path)
+def export_quantized_model(model, hparams, output_path):
+    """Export a quantized version of the model for efficient deployment."""
+    logger.info(f"Preparing model for quantization")
+
+    # 1. Set model to evaluation mode
     model.eval()
 
-    # Extract the core network without the Lightning wrapper
+    # 2. Create a quantization-ready copy of the model
+    import copy
+
+    quantized_model = copy.deepcopy(model)
+
+    # 3. Fuse modules for better quantization where possible
+    # (Conv + BatchNorm + ReLU patterns are prime candidates)
+    try:
+        from torch.quantization import fuse_modules
+
+        # Identify and fuse layers in convolutional front-end
+        # This pattern matches your model's structure
+        modules_to_fuse = []
+
+        # Find Conv-BN-ReLU patterns in conv_layers
+        layers = list(quantized_model.conv_layers)
+        for i in range(0, len(layers) - 2, 3):
+            if (
+                isinstance(layers[i], torch.nn.Conv1d)
+                and isinstance(layers[i + 1], torch.nn.BatchNorm1d)
+                and isinstance(layers[i + 2], torch.nn.ReLU)
+            ):
+                # Get the proper module paths
+                idx = i // 3
+                module_path = [
+                    f"conv_layers.{i}",
+                    f"conv_layers.{i+1}",
+                    f"conv_layers.{i+2}",
+                ]
+                modules_to_fuse.append(module_path)
+                logger.info(f"Fusing modules: {module_path}")
+
+        # Fuse the modules
+        if modules_to_fuse:
+            fuse_modules(quantized_model, modules_to_fuse, inplace=True)
+            logger.info(f"Fused {len(modules_to_fuse)} module groups")
+    except Exception as e:
+        logger.warning(f"Module fusion failed: {e}. Continuing without fusion.")
+
+    # 4. Configure quantization
+    quantized_model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
+    logger.info(f"Using qconfig: qnnpack (optimized for mobile)")
+
+    # 5. Prepare model for quantization
+    torch.quantization.prepare(quantized_model, inplace=True)
+
+    # 6. Calibrate with sample data (optimal but requires data)
+    # For now, we'll use a simpler approach with random data
+    logger.info("Calibrating quantization with random data")
+    n_mels = hparams.n_mels
+    # Generate 10 random samples for calibration
+    for _ in range(10):
+        calib_frames = min(
+            1500, hparams.max_frames
+        )  # Use smaller samples for calibration
+        dummy_input = torch.randn(1, calib_frames, n_mels)
+        quantized_model(dummy_input)
+
+    # 7. Convert to quantized model
+    logger.info("Converting model to quantized format")
+    torch.quantization.convert(quantized_model, inplace=True)
+
+    # 8. Save quantized model
+    torch.jit.save(torch.jit.script(quantized_model), output_path)
+    logger.info(f"Quantized model saved to {output_path}")
+
+    # 9. Report memory savings
+    original_size = os.path.getsize(output_path.replace("_quantized.pt", ".pt")) / (
+        1024 * 1024
+    )
+    quantized_size = os.path.getsize(output_path) / (1024 * 1024)
+    savings = (1 - quantized_size / original_size) * 100
+    logger.info(
+        f"Model size reduction: {original_size:.2f}MB → {quantized_size:.2f}MB ({savings:.1f}% smaller)"
+    )
+
+
+def export_model(model_path, output_path, export_onnx=True, quantize=True):
+    """Export a trained model for inference with ONNX and quantization options."""
+    logger.info(f"Loading checkpoint from {model_path}")
+    
+    # First load the checkpoint to extract hyperparameters
+    checkpoint = torch.load(model_path)
+    
+    # Then load the model with the hyperparameters
+    model = VADLightning.load_from_checkpoint(
+        model_path, 
+        hp=checkpoint['hyper_parameters']
+    )
+    model.eval()
+
+    # Rest of your function remains the same
     net = model.net
-
+    
+    # 1. TorchScript Export
     logger.info(f"Creating TorchScript model")
-    # Script the model for portable deployment
-    scripted_model = torch.jit.script(net)
 
-    logger.info(f"Saving model to {output_path}")
-    torch.jit.save(scripted_model, output_path)
-    logger.info(f"Model exported successfully")
-    print(f"✅ Model exported to {output_path}")
+    # 1. TorchScript Export
+    logger.info(f"Creating TorchScript model")
+    scripted_model = torch.jit.script(net)
+    torchscript_path = output_path
+    torch.jit.save(scripted_model, torchscript_path)
+    logger.info(f"TorchScript model exported to {torchscript_path}")
+
+    # 2. ONNX Export
+    if export_onnx:
+        onnx_path = output_path.replace(".pt", ".onnx")
+        logger.info(f"Exporting ONNX model to {onnx_path}")
+
+        # Create dummy input with expected shape (batch_size, max_frames, n_mels)
+        n_mels = model.hparams.n_mels
+        dummy_input = torch.randn(1, model.hparams.max_frames, n_mels)
+
+        # Export to ONNX format
+        torch.onnx.export(
+            net,  # model being exported
+            dummy_input,  # dummy input
+            onnx_path,  # output path
+            export_params=True,  # store model weights inside the model
+            opset_version=12,  # ONNX version
+            do_constant_folding=True,  # optimize constant folding
+            input_names=["input"],  # input names
+            output_names=["output"],  # output names
+            dynamic_axes={
+                "input": {0: "batch_size", 1: "sequence_length"},
+                "output": {0: "batch_size", 1: "sequence_length"},
+            },
+        )
+
+        # Verify the exported model
+        try:
+            import onnx
+
+            onnx_model = onnx.load(onnx_path)
+            onnx.checker.check_model(onnx_model)
+            logger.info("ONNX model verified successfully")
+        except ImportError:
+            logger.warning(
+                "ONNX package not found, skipping verification. Install with: pip install onnx"
+            )
+        except Exception as e:
+            logger.error(f"ONNX model verification failed: {e}")
+
+    # 3. Quantized Model Export (if requested)
+    if quantize:
+        quantized_path = output_path.replace(".pt", "_quantized.pt")
+        export_quantized_model(net, model.hparams, quantized_path)
+
+    logger.info(f"Model export completed successfully")
+    print(
+        f"✅ Model exported to {output_path}"
+        + (f", {output_path.replace('.pt', '.onnx')}" if export_onnx else "")
+        + (f", {output_path.replace('.pt', '_quantized.pt')}" if quantize else "")
+    )
 
 
 def perform_testing(trainer, model, args, checkpoint_callback):
@@ -515,17 +671,19 @@ def main(cli_args=None):
 
     # Export model if requested
     if (
-        args.export_model
+        (args.export_model or args.export_onnx or args.export_quantized)
         and hasattr(callbacks["checkpoint"], "best_model_path")
         and callbacks["checkpoint"].best_model_path
     ):
         logger.info(
             f"Exporting best model from {callbacks['checkpoint'].best_model_path}"
         )
-        export_model(callbacks["checkpoint"].best_model_path, args.export_path)
-
-    logger.info("Training script completed successfully")
-    return 0
+        export_model(
+            callbacks["checkpoint"].best_model_path, 
+            args.export_path,
+            export_onnx=args.export_onnx,
+            quantize=args.export_quantized
+        )
 
 
 if __name__ == "__main__":

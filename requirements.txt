@@ -5,6 +5,7 @@ torch
 torchaudio
 pytorch_lightning
 performer-pytorch
+onnx
 
 # Audio processing
 librosa
