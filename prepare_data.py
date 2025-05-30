@@ -2,6 +2,7 @@
 # ───────────────────────────────────────────────────────────────────────
 #  prepare_data.py Data preparation for MEL-spectrogram VAD
 # ───────────────────────────────────────────────────────────────────────
+from __future__ import annotations
 import numpy as np
 import librosa
 import scipy.signal as signal
@@ -17,7 +18,7 @@ from constant import *
 from tqdm import tqdm
 from pathlib import Path
 from datasets import load_dataset, Audio
-from typing import Dict, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from utils import (
     download_and_extract,
     logger,
@@ -26,12 +27,360 @@ from utils import (
     apply_eq,
     add_reverb,
     merge_vad_labels,
+    label_singing_vocals_heuristically,
+    get_original_path,
+    is_vocalset
 )
 
+# ────────────────────────────────────────────────────────────────────
+# ENV VAR DEFAULTS
+# ────────────────────────────────────────────────────────────────────
+os.environ.setdefault("HF_HOME", "D:/belajar/audio/vad/hf_cache")
+os.environ.setdefault("TRANSFORMERS_CACHE", "D:/belajar/audio/vad/hf_cache/models")
+os.environ.setdefault("HF_DATASETS_CACHE", "D:/belajar/audio/vad/hf_cache/datasets")
 
-os.environ["HF_HOME"] = "D:/belajar/audio/vad/hf_cache"
-os.environ["TRANSFORMERS_CACHE"] = "D:/belajar/audio/vad/hf_cache/models"
-os.environ["HF_DATASETS_CACHE"] = "D:/belajar/audio/vad/hf_cache/datasets"
+# ────────────────────────────────────────────────────────────────────
+# POLICY CONSTANTS & PARAMETERS
+# ────────────────────────────────────────────────────────────────────
+FLEURS_PREFIX = "fleurs_"
+FLEURS_SNR_THRESHOLD_DB = 10.0  # reject if SNR < 10 dB
+FLEURS_ANALYSIS_SEC = 5.0  # analyse first 5 s
+MAX_NOISY_RETRY = 6  # retries to get clean fleurs
+
+# ────────────────────────────────────────────────────────────────────
+# SMALL UTILITY HELPERS
+# ────────────────────────────────────────────────────────────────────
+
+
+
+def _is_noisy_fleurs(path: Path, sample_rate: int) -> bool:
+    """Return *True* if *path* is a FLEURS synthetic clip and appears very noisy.
+
+    Heuristic: load ≤ `FLEURS_ANALYSIS_SEC` seconds; compute frame‑wise RMS;
+    estimate speech = 90‑th percentile, noise = 10‑th; derive pseudo‑SNR.
+    Reject when SNR < `FLEURS_SNR_THRESHOLD_DB`.
+    """
+    if not path.name.startswith(FLEURS_PREFIX):
+        return False
+    try:
+        y, _ = librosa.load(
+            get_original_path(path),
+            sr=sample_rate,
+            mono=True,
+            duration=FLEURS_ANALYSIS_SEC,
+        )
+        if y.size == 0:
+            logger.warning("Empty audio when noise‑checking: %s", path)
+            return True
+        rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=512, center=True)[
+            0
+        ]
+        speech_rms = np.percentile(rms, 90)
+        noise_rms = np.percentile(rms, 10) + 1e-12
+        snr_db = 20 * np.log10(speech_rms / noise_rms + 1e-12)
+        return snr_db < FLEURS_SNR_THRESHOLD_DB
+    except Exception as exc:
+        logger.warning("Noise check failed for %s: %s", path, exc)
+        return True  # conservatively treat as noisy
+
+
+def _pick_speech_file(candidates: List[Path], sample_rate: int) -> Path:
+    """Return first candidate not flagged noisy; fallback to last pick."""
+    last: Optional[Path] = None
+    for _ in range(MAX_NOISY_RETRY):
+        cand = random.choice(candidates)
+        last = cand
+        if _is_noisy_fleurs(cand, sample_rate):
+            continue
+        return cand
+    return last  # if all noisy
+
+
+def _mix_at_snr_rms(s: np.ndarray, n: np.ndarray, snr_db: float) -> np.ndarray:
+    """Scale noise to reach target SNR (RMS‑based) then add."""
+    if n.size < s.size:
+        reps = int(np.ceil(s.size / n.size))
+        n = np.tile(n, reps)[: s.size]
+    else:
+        n = n[: s.size]
+    s_rms = np.sqrt(np.mean(s**2)) + 1e-9
+    n_rms = np.sqrt(np.mean(n**2)) + 1e-9
+    n *= (s_rms / (10 ** (snr_db / 20))) / n_rms
+    mix = s + n
+    peak = np.max(np.abs(mix))
+    if peak > 0.99:
+        mix *= 0.99 / peak
+    return mix.astype(np.float32)
+
+
+# ────────────────────────────────────────────────────────────────────
+# 1. CLEAN SPEECH SAMPLE
+# ────────────────────────────────────────────────────────────────────
+
+
+def create_clean_speech_sample_with_silero(
+    speech_files: List[Path],
+    duration: float,
+    sample_rate: int,
+    win_length: int,
+    hop_length: int,
+    vad_model: Tuple,
+):
+    model, utils = vad_model
+    sp_path = _pick_speech_file(speech_files, sample_rate)
+    orig = get_original_path(sp_path)
+    speech = load_and_process_audio(orig, sample_rate, duration)
+    speech = librosa.util.fix_length(data=speech, size=int(duration * sample_rate))
+    if is_vocalset(sp_path):
+        labels = label_singing_vocals_heuristically(
+            orig, frame_hop_length=hop_length, sample_rate=sample_rate
+        )
+    else:
+        # Use named parameters to avoid parameter order issues
+        labels = generate_silero_vad_labels(
+            audio=speech,
+            sample_rate=sample_rate,
+            model=model,
+            hop_length=hop_length,
+            win_length=win_length,
+            utils=utils,
+        )
+    return np.clip(speech, -1.0, 1.0), labels
+
+
+# ────────────────────────────────────────────────────────────────────
+# 2. SPEECH + MUSIC SAMPLE
+# ────────────────────────────────────────────────────────────────────
+
+
+def create_speech_music_sample_with_silero(
+    speech_files: List[Path],
+    music_files: List[Path],
+    duration: float,
+    sample_rate: int,
+    win_length: int,
+    hop_length: int,
+    vad_model: Tuple,
+):
+    model, utils = vad_model
+    sp_path = _pick_speech_file(speech_files, sample_rate)
+    mu_path = random.choice(music_files)
+    speech = load_and_process_audio(get_original_path(sp_path), sample_rate, duration)
+    music = load_and_process_audio(get_original_path(mu_path), sample_rate, duration)
+    target = int(duration * sample_rate)
+    speech = librosa.util.fix_length(speech, size=target)
+    music = librosa.util.fix_length(music, size=target)
+    mix = _mix_at_snr_rms(speech, music, random.uniform(0, 25))
+    if is_vocalset(sp_path):
+        labels = label_singing_vocals_heuristically(
+            get_original_path(sp_path),
+            frame_hop_length=hop_length,
+            sample_rate=sample_rate,
+        )
+    else:
+        labels = clean_first_labels(
+            speech, mix, vad_model, sample_rate, hop_length, win_length, extra_pass=True
+        )
+    return mix, labels
+
+
+# ────────────────────────────────────────────────────────────────────
+# 3. OVERLAPPING SPEECH + NOISE
+# ────────────────────────────────────────────────────────────────────
+
+
+def create_overlapping_speech_with_silero(
+    speech_files: List[Path],
+    noise_files: List[Path],
+    duration: float,
+    sample_rate: int,
+    win_length: int,
+    hop_length: int,
+    vad_model: Tuple,
+):
+    model, utils = vad_model
+    sp1 = _pick_speech_file(speech_files, sample_rate)
+    sp2 = _pick_speech_file([p for p in speech_files if p != sp1], sample_rate)
+    nz_path = random.choice(noise_files)
+    s1 = load_and_process_audio(get_original_path(sp1), sample_rate, duration)
+    s2 = load_and_process_audio(get_original_path(sp2), sample_rate, duration)
+    noise = load_and_process_audio(get_original_path(nz_path), sample_rate, duration)
+    target = int(duration * sample_rate)
+    s1 = librosa.util.fix_length(s1, size=target)
+    s2 = librosa.util.fix_length(s2, size=target)
+    noise = librosa.util.fix_length(noise, size=target)
+    overlap = (
+        s1 + 10 ** (-random.uniform(5, 15) / 20) * np.std(s1) / (np.std(s2) + 1e-7) * s2
+    )
+    mix = _mix_at_snr_rms(overlap, noise, 10)
+
+    def _lab(p: Path, sig: np.ndarray):
+        return (
+            label_singing_vocals_heuristically(
+                get_original_path(p),
+                frame_hop_length=hop_length,
+                sample_rate=sample_rate,
+            )
+            if is_vocalset(p)
+            else generate_silero_vad_labels(
+                audio=sig,
+                sample_rate=sample_rate,
+                model=model,
+                hop_length=hop_length,
+                win_length=win_length,
+                utils=utils,
+            )
+        )
+
+    lab1 = _lab(sp1, s1)
+    lab2 = _lab(sp2, s2)
+
+    # Ensure the labels have the same length before merging
+    min_len = min(len(lab1), len(lab2))
+    lab1 = lab1[:min_len]
+    lab2 = lab2[:min_len]
+
+    labels = merge_vad_labels(lab1, lab2)
+    return mix, labels
+
+
+# ────────────────────────────────────────────────────────────────────
+# 4. SPEECH + NOISE + MUSIC
+# ────────────────────────────────────────────────────────────────────
+
+
+def create_speech_noise_music_sample_with_silero(
+    speech_files: List[Path],
+    noise_files: List[Path],
+    music_files: List[Path],
+    duration: float,
+    sample_rate: int,
+    win_length: int,
+    hop_length: int,
+    vad_model: Tuple,
+):
+    model, utils = vad_model
+    sp = _pick_speech_file(speech_files, sample_rate)
+    nz = random.choice(noise_files)
+    mu = random.choice(music_files)
+    speech = load_and_process_audio(get_original_path(sp), sample_rate, duration)
+    noise = load_and_process_audio(get_original_path(nz), sample_rate, duration)
+    music = load_and_process_audio(get_original_path(mu), sample_rate, duration)
+    target = int(duration * sample_rate)
+    speech = librosa.util.fix_length(speech, size=target)
+    noise = librosa.util.fix_length(noise, size=target)
+    music = librosa.util.fix_length(music, size=target)
+    mix_tmp = _mix_at_snr_rms(speech, noise, random.uniform(-5, 20))
+    mix = _mix_at_snr_rms(mix_tmp, music, random.uniform(5, 25))
+    if is_vocalset(sp):
+        labels = label_singing_vocals_heuristically(
+            get_original_path(sp), frame_hop_length=hop_length, sample_rate=sample_rate
+        )
+    else:
+        labels = clean_first_labels(
+            speech, mix, vad_model, sample_rate, hop_length, win_length, extra_pass=True
+        )
+    return mix, labels
+
+
+# ────────────────────────────────────────────────────────────────────
+# 5. SPEECH + NOISE AUG SAMPLE (POSITIVE)
+# ────────────────────────────────────────────────────────────────────
+
+
+def create_speech_noise_sample_with_silero(
+    selected_speech_file: Path,
+    duration_range: Tuple[float, float],
+    sample_rate: int,
+    vad_model_tuple: Tuple,
+    musan_noise_files: List[Path],
+    snr_range: Tuple[float, float],
+    hop_length: int,
+    win_length: int,
+    out_pos_dir: Path,
+    out_pos_labels_dir: Path,
+    idx: int,
+    file_prefix_base: str = "pos_sn",
+) -> bool:
+    """Create one speech+noise sample and save wav+npy."""
+    duration = random.uniform(*duration_range)
+    target_len = int(duration * sample_rate)
+    original = get_original_path(selected_speech_file)
+    speech = load_and_process_audio(
+        original,
+        sample_rate,
+        duration=duration,
+        target_length=target_len,
+        random_offset=True,
+    )
+    if speech is None or speech.size == 0:
+        logger.warning("Failed load: %s", original)
+        return False
+
+    # ⇣ optional pitch/time aug
+    if random.random() < 0.5:
+        speech = librosa.effects.time_stretch(speech, rate=random.uniform(0.9, 1.1))
+    if random.random() < 0.5:
+        speech = librosa.effects.pitch_shift(
+            speech, sr=sample_rate, n_steps=random.uniform(-3.5, 3.5)
+        )
+    speech = librosa.util.fix_length(speech, size=target_len)
+    clean_for_vad = speech.copy()
+
+    # volume tweak
+    vol_factor = (
+        random.uniform(0.1, 0.4) if random.random() < 0.2 else random.uniform(0.7, 1.4)
+    )
+    speech *= vol_factor
+    if np.std(speech) < 1e-4:
+        return False
+
+    model, utils = vad_model_tuple
+    if is_vocalset(selected_speech_file):
+        vad_labels = label_singing_vocals_heuristically(
+            original, frame_hop_length=hop_length, sample_rate=sample_rate
+        )
+    else:
+        vad_labels = generate_silero_vad_labels(
+            audio=clean_for_vad,
+            sample_rate=sample_rate,
+            model=model,
+            hop_length=hop_length,
+            win_length=win_length,
+            utils=utils,
+        )
+    if vad_labels is None:
+        return False
+
+    if random.random() < 0.3:
+        speech = add_reverb(speech, sample_rate)
+    if random.random() < 0.25:
+        speech = apply_eq(speech, sample_rate)
+
+    noise_path = random.choice(musan_noise_files)
+    noise = load_and_process_audio(noise_path, sample_rate, duration)
+    noise = librosa.util.fix_length(noise, size=target_len)
+    snr_db = (
+        random.uniform(-10, -3)
+        if random.random() < 0.15
+        else random.uniform(*snr_range)
+    )
+    mix = _mix_at_snr_rms(speech, noise, snr_db)
+
+    if not validate_audio_sample(mix, sample_rate):
+        return False
+
+    tag = (
+        "fleurs"
+        if selected_speech_file.name.startswith("fleurs_")
+        else "vocalset" if is_vocalset(selected_speech_file) else "other"
+    )
+    prefix = f"{file_prefix_base}_{tag}"
+    wav_path = out_pos_dir / f"{prefix}_{idx:06}.wav"
+    lab_path = out_pos_labels_dir / f"{prefix}_{idx:06}_labels.npy"
+    sf.write(wav_path, mix, sample_rate)
+    np.save(lab_path, vad_labels)
+    return True
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -309,50 +658,6 @@ def generate_silero_vad_labels(
     return vad_labels
 
 
-def create_clean_speech_sample_with_silero(
-    speech_files, duration, sample_rate, win_length, hop_length, vad_model
-):
-    """
-    Create a clean speech sample and generate labels with Silero VAD.
-
-    Args:
-        speech_files: List of speech audio files
-        duration: Target duration in seconds
-        sample_rate: Audio sample rate
-        win_length: Window length for frame analysis
-        hop_length: Hop length for frame analysis
-        vad_model: Silero VAD model
-
-    Returns:
-        Tuple of (clean audio, VAD labels)
-    """
-    model, utils = vad_model
-    # Select random speech file
-    speech_path = random.choice(speech_files)
-
-    # Load audio
-    speech = load_and_process_audio(speech_path, sample_rate, duration)
-
-    # Ensure consistent length
-    target_length = int(duration * sample_rate)
-    speech = librosa.util.fix_length(speech, size=target_length)
-
-    # Generate labels using Silero VAD
-    vad_labels = generate_silero_vad_labels(
-        speech,
-        sample_rate,
-        model,
-        hop_length=hop_length,
-        win_length=win_length,
-        utils=utils,  # Pass utils as a named parameter
-    )
-
-    # Normalize but don't add any noise or effects
-    speech = np.clip(speech, -1.0, 1.0)
-
-    return speech, vad_labels
-
-
 def clean_first_labels(
     clean, mix, vad_model, sample_rate, hop, win, extra_pass=False, mixed_threshold=0.4
 ):
@@ -365,7 +670,12 @@ def clean_first_labels(
     from prepare_data import generate_silero_vad_labels  # re-use your existing fn
 
     base = generate_silero_vad_labels(
-        clean, sample_rate, model, hop_length=hop, win_length=win, utils=utils
+        audio=clean,
+        sample_rate=sample_rate,
+        model=model,
+        hop_length=hop,
+        win_length=win,
+        utils=utils,
     )
 
     if not extra_pass:
@@ -1046,7 +1356,7 @@ def ingest_fleurs(
 
         try:
             ds = load_dataset(
-                "google/fleurs-r",
+                "google/fleurs",
                 cfg,
                 split="validation" if split == "val" else split,
                 streaming=streaming,
@@ -1623,188 +1933,6 @@ def process_musdb(
     return all_music
 
 
-def create_speech_music_sample_with_silero(
-    speech_files, music_files, duration, sample_rate, win_length, hop_length, vad_model
-):
-    """
-    Create a sample with speech over music background using Silero VAD for labels.
-
-    Args:
-        speech_files: List of speech audio files
-        music_files: List of music audio files
-        duration: Target duration in seconds
-        sample_rate: Audio sample rate
-        win_length: Window length for frame analysis
-        hop_length: Hop length for frame analysis
-        vad_model: Silero VAD model
-
-    Returns:
-        Tuple of (mixed audio, VAD labels)
-    """
-    model, utils = vad_model
-    # Select source files
-    speech_path = random.choice(speech_files)
-    music_path = random.choice(music_files)
-
-    # Load audio
-    speech = load_and_process_audio(speech_path, sample_rate, duration)
-    music = load_and_process_audio(music_path, sample_rate, duration)
-
-    # Ensure same length
-    target_length = int(duration * sample_rate)
-    speech = librosa.util.fix_length(speech, size=target_length)
-    music = librosa.util.fix_length(music, size=target_length)
-
-    # Mix speech with music at varying SNR
-    # Using lower SNR than speech+noise since music is less masking than noise
-    snr_db = random.uniform(0, 25)  # Higher SNR range than with noise
-    alpha = 10 ** (-snr_db / 20) * np.std(speech) / (np.std(music) + 1e-7)
-    mix = speech + alpha * music
-    mix = np.clip(mix, -1.0, 1.0)
-
-    vad_labels = clean_first_labels(
-        speech, mix, vad_model, sample_rate, hop_length, win_length, extra_pass=True
-    )  # second pass helps when vocals leak in music
-
-    return mix, vad_labels
-
-
-def create_overlapping_speech_with_silero(
-    speech_files, noise_files, duration, sample_rate, win_length, hop_length, vad_model
-):
-    """
-    Create an overlapping speech sample with Silero VAD labels.
-
-    Args:
-        speech_files: List of speech audio files
-        noise_files: List of noise audio files
-        duration: Target duration in seconds
-        sample_rate: Audio sample rate
-        win_length: Window length for frame analysis
-        hop_length: Hop length for frame analysis
-        vad_model: Silero VAD model
-
-    Returns:
-        Tuple of (mixed audio, VAD labels)
-    """
-    model, utils = vad_model
-    # Select two different speech files
-    speech1, speech2 = random.sample(speech_files, 2)
-
-    # Load and process both speech files
-    primary = load_and_process_audio(speech1, sample_rate, duration)
-    secondary = load_and_process_audio(speech2, sample_rate, duration)
-
-    # Make primary and secondary same length
-    target_length = int(duration * sample_rate)
-    primary = librosa.util.fix_length(primary, size=target_length)
-    secondary = librosa.util.fix_length(secondary, size=target_length)
-
-    # Make secondary speech quieter (foreground vs background speaker)
-    snr_db = random.uniform(5, 15)  # Reasonable SNR for overlapping speech
-    alpha = 10 ** (-snr_db / 20) * np.std(primary) / (np.std(secondary) + 1e-7)
-
-    # Add noise too for realism
-    noise_path = random.choice(noise_files)
-    noise = load_and_process_audio(noise_path, sample_rate, duration)
-    noise = librosa.util.fix_length(noise, size=target_length)
-
-    # Create the final mixture
-    mix = primary + alpha * secondary + 0.1 * noise
-    mix = np.clip(mix, -1.0, 1.0)  # Normalize
-
-    labels_primary = generate_silero_vad_labels(
-        primary,
-        sample_rate,
-        model,
-        hop_length=hop_length,
-        win_length=win_length,
-        utils=utils,
-    )
-
-    labels_secondary = generate_silero_vad_labels(
-        secondary,
-        sample_rate,
-        model,
-        hop_length=hop_length,
-        win_length=win_length,
-        utils=utils,
-    )
-
-    vad_labels = merge_vad_labels(labels_primary, labels_secondary)
-
-    return mix, vad_labels
-
-
-def create_speech_noise_music_sample_with_silero(
-    speech_files,
-    noise_files,
-    music_files,
-    duration,
-    sample_rate,
-    win_length,
-    hop_length,
-    vad_model,
-):
-    """
-    Create a sample with speech + background noise + music using Silero VAD for labels.
-
-    Args:
-        speech_files: List of speech audio files
-        noise_files: List of noise audio files
-        music_files: List of music audio files
-        duration: Target duration in seconds
-        sample_rate: Audio sample rate
-        win_length: Window length for frame analysis
-        hop_length: Hop length for frame analysis
-        vad_model: Tuple of (model, utils) for Silero VAD
-
-    Returns:
-        Tuple of (mixed audio, VAD labels)
-    """
-    model, utils = vad_model
-
-    # Select source files
-    speech_path = random.choice(speech_files)
-    noise_path = random.choice(noise_files)
-    music_path = random.choice(music_files)
-
-    # Load audio
-    speech = load_and_process_audio(speech_path, sample_rate, duration)
-    noise = load_and_process_audio(noise_path, sample_rate, duration)
-    music = load_and_process_audio(music_path, sample_rate, duration)
-
-    # Ensure same length
-    target_length = int(duration * sample_rate)
-    speech = librosa.util.fix_length(speech, size=target_length)
-    noise = librosa.util.fix_length(noise, size=target_length)
-    music = librosa.util.fix_length(music, size=target_length)
-
-    # Mix with varying SNRs
-    # Speech-to-noise ratio
-    speech_noise_snr = random.uniform(-5, 20)
-    noise_scaling = (
-        10 ** (-speech_noise_snr / 20) * np.std(speech) / (np.std(noise) + 1e-7)
-    )
-
-    # Speech-to-music ratio (typically higher for better intelligibility)
-    speech_music_snr = random.uniform(5, 25)
-    music_scaling = (
-        10 ** (-speech_music_snr / 20) * np.std(speech) / (np.std(music) + 1e-7)
-    )
-
-    # Create the mixture
-    mix = speech + noise_scaling * noise + music_scaling * music
-    mix = np.clip(mix, -1.0, 1.0)  # Normalize
-
-    # Generate labels using Silero VAD
-    vad_labels = clean_first_labels(
-        speech, mix, vad_model, sample_rate, hop_length, win_length, extra_pass=True
-    )
-
-    return mix, vad_labels
-
-
 def create_manifest(
     prep_dir: pathlib.Path, manifest_path: pathlib.Path, split_name: str
 ):
@@ -1949,7 +2077,7 @@ def prepare_dataset(
             model, utils = initialize_silero_vad()
             vad_model = (model, utils)  # Pack both model and utils
 
-        from generate_samples import make_pos_neg
+        from generate_samples_refactored import make_pos_neg
 
         make_pos_neg(
             libri_root,

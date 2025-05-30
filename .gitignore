@@ -13,3 +13,7 @@ CLI.txt
 lightning_logs
 **/*.png
 **/*.csv
+**/*.rar
+mel_cache
+models
+plan.md

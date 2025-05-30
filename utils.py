@@ -2,6 +2,11 @@ import argparse, csv, random, pathlib, subprocess, sys, json, logging, time
 import numpy as np
 import librosa
 import scipy.signal as signal
+from pathlib import Path
+from typing import Optional
+from scipy.ndimage import binary_closing, binary_dilation
+from config import *
+
 
 # Configure logging
 logging.basicConfig(
@@ -10,6 +15,24 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+def is_vocalset(path: Path) -> bool:
+    tag = "vocalset_"
+    return path.name.lower().startswith(tag) or any(
+        part.lower() == tag for part in path.parts
+    )
+
+
+def get_original_path(path: Path) -> Path:
+    """Remove synthetic prefix (vocalset_, fleurs_, …) and return actual disk file."""
+    if not isinstance(path, Path):
+        path = Path(path)
+    fname = path.name
+    if any(
+        fname.startswith(pref) for pref in ["vocalset_", "libri_", "musan_", "fleurs_"]
+    ):
+        return path.parent / fname.split("_", 1)[1]
+    return path
 
 
 def add_reverb(audio, sr, wet_level=None):
@@ -256,11 +279,13 @@ def stratified_librispeech_sample(libri_files, n_samples=10000):
     """Sample LibriSpeech files with stratification by speaker."""
     speakers = {}
     for libri in libri_files:
+        # Use get_original_path to get the actual file path
+        actual_path = get_original_path(libri)
         # Extract speaker ID from path structure
-        speaker = str(libri.parent.parent.name)
+        speaker = str(actual_path.parent.parent.name)
         if speaker not in speakers:
             speakers[speaker] = []
-        speakers[speaker].append(libri)
+        speakers[speaker].append(libri)  # Keep original path for selection
 
     # Calculate per-speaker quota
     n_speakers = len(speakers)
@@ -296,11 +321,13 @@ def stratified_fleurs_sample(fleurs_files, n_samples=10000):
     # Group files by language code
     languages = {}
     for file_path in fleurs_files:
+        # Use get_original_path to get the actual file path
+        actual_path = get_original_path(file_path)
         # Extract language code from filename (format: {lang_code}_{id}.wav)
-        lang_code = file_path.stem.split("_")[0]
+        lang_code = actual_path.stem.split("_")[0]
         if lang_code not in languages:
             languages[lang_code] = []
-        languages[lang_code].append(file_path)
+        languages[lang_code].append(file_path)  # Keep original path for selection
 
     # Calculate per-language quota
     n_languages = len(languages)
@@ -335,3 +362,189 @@ def merge_vad_labels(*label_arrays):
     for arr in label_arrays:
         merged = np.maximum(merged, arr)
     return merged
+
+
+
+def label_singing_vocals_heuristically(
+    audio_path: Path,
+    frame_hop_length: int = DEFAULT_HOP_LENGTH,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    *,
+    # --- Tunables with improved defaults for singing -------------
+    energy_rms_frame_ms: int = 25,
+    energy_rms_hop_ms: int = 10,
+    energy_thresh_percentile: int = 5,      # Lower to 5% to catch very quiet singing
+    pitch_fmin: float = librosa.note_to_hz("A2"),
+    pitch_fmax: float = librosa.note_to_hz("C6"),
+    voiced_prob_threshold: float = 0.2,    # Even more permissive threshold
+    min_segment_duration_ms: int = 60,      # Shorter to catch brief onsets
+    expand_segment_ms: int = 100,           # Expand more to connect segments
+    smoothing_filter_size: int = 7,
+    apply_normalization: bool = True,
+    apply_preemphasis: bool = True, 
+    use_alternative_method: bool = True,
+    detect_quiet_beginnings: bool = True,   # NEW: special handling for quiet starts
+) -> np.ndarray:
+    """Return frame‑level 0/1 labels indicating probable singing voice.
+
+    Enhanced for singing voice detection with normalization, pre-emphasis,
+    and alternative detection for subtle singing passages.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Load & pre‑process audio (stereo → mono, resample)
+    # ------------------------------------------------------------------
+    try:
+        y, sr_orig = librosa.load(audio_path, sr=None, mono=False)
+    except Exception as exc:
+        logger.error("Failed to read %s: %s", audio_path, exc)
+        return np.zeros(1, dtype=np.float32)
+
+    if y.ndim == 2:  # stereo → mono while avoiding phase cancellation issues
+        y = librosa.to_mono(y)
+    if sr_orig != sample_rate:
+        y = librosa.resample(y, orig_sr=sr_orig, target_sr=sample_rate)
+
+    if y.size == 0:  # empty file guard
+        return np.zeros(1, dtype=np.float32)
+    
+    # NEW: Normalize audio to improve consistency
+    if apply_normalization and np.abs(y).max() > 0:
+        y = y / np.abs(y).max() * 0.9  # Scale to 90% of max amplitude
+    
+    # ------------------------------------------------------------------
+    # 2. Feature extraction (Energy + Pitch) at a *feature* rate
+    # ------------------------------------------------------------------
+    rms_frame_len = int(sample_rate * energy_rms_frame_ms / 1000)
+    rms_hop_len = int(sample_rate * energy_rms_hop_ms / 1000)
+    
+    # NEW: Apply pre-emphasis to boost high frequencies if enabled
+    y_for_energy = y
+    if apply_preemphasis:
+        y_for_energy = librosa.effects.preemphasis(y, coef=0.97)
+    
+    # Calculate RMS energy on possibly pre-emphasized signal
+    rms_energy = librosa.feature.rms(
+        y=y_for_energy, 
+        frame_length=rms_frame_len,
+        hop_length=rms_hop_len, 
+        center=True
+    )[0]
+
+    # Calculate pitch on original (not pre-emphasized) signal
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        y,  # Use original signal for pitch
+        fmin=pitch_fmin,
+        fmax=pitch_fmax,
+        sr=sample_rate,
+        frame_length=rms_frame_len,
+        hop_length=rms_hop_len,
+        center=True,
+        fill_na=0.0,
+    )
+
+    # Align arrays length if pyin pads one extra frame
+    n_feat_frames = min(len(rms_energy), len(voiced_prob))
+    rms_energy = rms_energy[:n_feat_frames]
+    voiced_prob = voiced_prob[:n_feat_frames]
+    
+    # ------------------------------------------------------------------
+    # 3. Initial decision rule (energy + voicing)
+    # ------------------------------------------------------------------
+    energy_threshold = np.percentile(rms_energy, energy_thresh_percentile)
+    energy_threshold = max(energy_threshold, 1e-5)  # protect against zero
+
+    is_energetic = rms_energy > energy_threshold
+    is_voiced = voiced_prob > voiced_prob_threshold
+    speech_mask = (is_energetic & is_voiced).astype(np.uint8)
+    
+    # New block to add near line 118 in your function:
+    # Further enhancement for low/quiet singing specifically
+    if use_alternative_method:
+        # [your existing code]
+        
+        # NEW: Additional pass specifically for low notes (which may have good voicing confidence but low energy)
+        low_notes_mask = np.logical_and(
+            voiced_prob > 0.3,  # Even more permissive for low notes
+            f0 < librosa.note_to_hz("E3")  # Focus on low notes
+        ).astype(np.uint8)
+        
+        # Add low notes to our speech mask
+        speech_mask = np.logical_or(speech_mask, low_notes_mask).astype(np.uint8)
+        
+        # NEW: Special handling for extremely quiet singing with some pitch evidence
+        # This is especially important for the beginnings of notes or quiet sustains
+        if detect_quiet_beginnings:
+            # Find regions with ANY detectable pitch (very permissive)
+            any_pitch_evidence = voiced_prob > 0.15
+            
+            # Find regions with minimal energy (above absolute noise floor)
+            minimal_energy = rms_energy > (np.max(rms_energy) * 0.02)  # Just 1% of max
+            
+            # Combine for extremely subtle singing detection
+            quiet_singing_mask = np.logical_and(
+                any_pitch_evidence, 
+                minimal_energy
+            ).astype(np.uint8)
+            
+            # Only add short segments (for safety - to avoid false positives)
+            # This looks for short segments that might be note beginnings
+            quiet_diff = np.diff(np.concatenate(([0], quiet_singing_mask, [0])))
+            quiet_starts = np.where(quiet_diff == 1)[0]
+            quiet_ends = np.where(quiet_diff == -1)[0]
+            
+            # Target very short segments for special protection (likely note beginnings)
+            very_short_mask = np.zeros_like(quiet_singing_mask)
+            for s, e in zip(quiet_starts, quiet_ends):
+                segment_len = e - s
+                if segment_len > 0 and segment_len < 30:  # Very short segments only
+                    very_short_mask[s:e] = 1
+            
+            # Add these protected quiet beginnings
+            speech_mask = np.logical_or(speech_mask, very_short_mask).astype(np.uint8)
+
+    # ------------------------------------------------------------------
+    # 4. Morphological smoothing & remove short blobs (unchanged)
+    # ------------------------------------------------------------------
+    if smoothing_filter_size % 2 == 0:
+        smoothing_filter_size += 1  # ensure odd
+
+    speech_mask = binary_closing(
+        speech_mask,
+        structure=np.ones(smoothing_filter_size, dtype=np.uint8),
+    ).astype(np.uint8)
+
+    # Remove blobs shorter than minimum length
+    min_seg_frames = int(np.round(min_segment_duration_ms / 1000 * sample_rate / rms_hop_len))
+    if min_seg_frames > 1:
+        diff = np.diff(np.concatenate(([0], speech_mask, [0])))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+        for s, e in zip(starts, ends):
+            if (e - s) < min_seg_frames:
+                speech_mask[s:e] = 0
+
+    # Expand segments to catch onsets/offsets
+    if expand_segment_ms > 0 and speech_mask.any():
+        expand_frames = int(np.round(expand_segment_ms / 1000 * sample_rate / rms_hop_len))
+        speech_mask = binary_dilation(
+            speech_mask,
+            structure=np.ones(expand_frames * 2 + 1, dtype=np.uint8),
+        ).astype(np.uint8)
+
+    # ------------------------------------------------------------------
+    # 5. Resample labels to VAD frame rate (vectorised, unchanged)
+    # ------------------------------------------------------------------
+    feature_times = librosa.frames_to_time(np.arange(len(speech_mask)),
+                                           sr=sample_rate, hop_length=rms_hop_len)
+    num_out_frames = int(np.ceil(len(y) / frame_hop_length))
+    if num_out_frames == 0:
+        num_out_frames = 1
+
+    vad_times = librosa.frames_to_time(np.arange(num_out_frames),
+                                       sr=sample_rate, hop_length=frame_hop_length)
+
+    out_labels = np.interp(vad_times, feature_times, speech_mask).astype(np.float32)
+    out_labels = (out_labels >= 0.5).astype(np.float32)
+
+    return out_labels

@@ -2,6 +2,9 @@
 # ───────────────────────────────────────────────────────────────────────
 #  evaluation.py - Metrics visualization for MEL-spectrogram VAD model
 # ───────────────────────────────────────────────────────────────────────
+from tqdm import tqdm
+from functools import wraps
+
 from config import (
     DEFAULT_N_MELS,
     DEFAULT_N_FFT,
@@ -48,6 +51,193 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+def merge_short_gaps(segments, max_gap_size=3):
+    """Merge speech segments separated by brief gaps."""
+    if not segments:
+        return []
+        
+    merged = [segments[0]]
+    
+    for current in segments[1:]:
+        previous_end = merged[-1][1]
+        current_start = current[0]
+        
+        # If gap is small enough, merge
+        if current_start - previous_end <= max_gap_size:
+            merged[-1] = (merged[-1][0], current[1])
+        else:
+            merged.append(current)
+            
+    return merged
+
+def filter_short_segments(segments, min_duration=5):
+    """Filter out segments shorter than min_duration frames."""
+    return [seg for seg in segments if (seg[1] - seg[0] + 1) >= min_duration]
+
+def smooth_predictions(frame_preds, window_size=7, threshold=0.5):
+    """Apply temporal smoothing to reduce over-segmentation."""
+    from scipy.ndimage import median_filter, uniform_filter1d
+    
+    # First apply median filtering to remove brief spikes/drops
+    smoothed = median_filter(frame_preds, size=window_size)
+    
+    # Then apply moving average to smooth transitions
+    smoothed = uniform_filter1d(smoothed, size=window_size*2)
+    
+    # Convert to binary predictions
+    binary_preds = (smoothed >= threshold).astype(int)
+    
+    return binary_preds, smoothed
+
+def batched_inference(max_batches=None, progress=True):
+    """Decorator for batched model inference with progress tracking."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(model, dataloader, *args, **kwargs):
+            all_results = []
+            total = len(dataloader) if max_batches is None else min(max_batches, len(dataloader))
+            
+            iterator = tqdm(dataloader, total=total) if progress else dataloader
+            
+            with torch.no_grad():
+                for i, batch in enumerate(iterator):
+                    if max_batches and i >= max_batches:
+                        break
+                        
+                    result = func(model, batch, *args, **kwargs)
+                    all_results.append(result)
+            
+            return all_results
+        return wrapper
+    return decorator
+
+
+@batched_inference(progress=True)
+def process_batch(model, batch, device):
+    """Process a single batch with the model."""
+    mel, labels, mask = batch
+    mel = mel.to(device)
+    logits = model(mel)
+    preds = torch.sigmoid(logits)
+    
+    results = []
+    for i in range(mel.shape[0]):
+        valid_frames = mask[i].sum().item()
+        sample_preds = preds[i, :valid_frames].cpu().numpy()
+        sample_labels = labels[i, :valid_frames].cpu().numpy()
+        
+        # Calculate clip-level prediction and ground truth
+        clip_pred = sample_preds.mean()
+        clip_label = 1.0 if sample_labels.max() > 0.5 else 0.0
+        
+        results.append({
+            "frame_preds": sample_preds,
+            "frame_labels": sample_labels,
+            "clip_pred": clip_pred,
+            "clip_label": clip_label
+        })
+        
+    return results
+
+def load_model_by_type(model_path, args, model_type="pytorch"):
+    """Load a model based on its type (pytorch, lightning, or quantized)."""
+    logger.info(f"Loading {model_type} model from {model_path}")
+    
+    if model_type == "lightning":
+        # For Lightning checkpoints, load using the proper Lightning API
+        checkpoint = torch.load(model_path, map_location=args.device)
+        
+        # Create the VADLightning model with hyperparameters from checkpoint
+        if "hyper_parameters" in checkpoint:
+            hparams = checkpoint["hyper_parameters"]
+            from types import SimpleNamespace
+            hp_namespace = SimpleNamespace(**hparams)
+            
+            # Create and load the Lightning model
+            pl_model = VADLightning(hp_namespace)
+            pl_model.load_state_dict(checkpoint["state_dict"])
+            
+            # Extract just the network part
+            inference_model = pl_model.net
+        else:
+            logger.error("Lightning checkpoint missing hyperparameters")
+            raise ValueError("Invalid Lightning checkpoint format")
+    
+    elif model_type == "pytorch":
+        # Load a standard PyTorch model state dict
+        state_dict = torch.load(model_path, map_location=args.device)
+        
+        # Detect model dimension
+        dim = None
+        if "pos_embedding" in state_dict:
+            dim = state_dict["pos_embedding"].shape[2]
+            logger.info(f"Detected model dimension from pos_embedding: {dim}")
+        elif "proj.weight" in state_dict:
+            dim = state_dict["proj.weight"].shape[0]
+            logger.info(f"Detected model dimension from proj.weight: {dim}")
+        
+        # Default fallback
+        if dim is None:
+            dim = getattr(args, 'dim', 192)
+            logger.info(f"Using dimension from config: {dim}")
+        
+        # Create model with correct dimensions
+        from models import MelPerformer
+        inference_model = MelPerformer(
+            n_mels=args.n_mels,
+            dim=dim,
+            layers=getattr(args, 'n_layers', 4),
+            heads=getattr(args, 'n_heads', 4),
+            max_seq_len=args.max_frames
+        )
+        
+        logger.info(f"Loading PyTorch state dict into model with dim={dim}")
+        inference_model.load_state_dict(state_dict)
+            
+    elif model_type == "quantized":
+        # FIXED APPROACH: Load state dict into regular model first, then quantize
+        state_dict = torch.load(model_path, map_location=args.device)
+        
+        # Detect model dimension
+        dim = None
+        if "pos_embedding" in state_dict:
+            dim = state_dict["pos_embedding"].shape[2]
+            logger.info(f"Detected model dimension from pos_embedding: {dim}")
+        elif "proj.weight" in state_dict:
+            dim = state_dict["proj.weight"].shape[0]
+            logger.info(f"Detected model dimension from proj.weight: {dim}")
+        
+        # Default fallback
+        if dim is None:
+            dim = getattr(args, 'dim', 192)
+            logger.info(f"Using dimension from config: {dim}")
+        
+        # Create a regular model first
+        from models import MelPerformer
+        base_model = MelPerformer(
+            n_mels=args.n_mels,
+            dim=dim,
+            layers=getattr(args, 'n_layers', 4),
+            heads=getattr(args, 'n_heads', 4),
+            max_seq_len=args.max_frames
+        )
+        
+        # Load weights into the regular model
+        logger.info("Loading weights into base model before quantization")
+        base_model.load_state_dict(state_dict)
+        
+        # Now quantize the model after loading weights
+        logger.info("Applying dynamic quantization to loaded model")
+        inference_model = torch.quantization.quantize_dynamic(
+            base_model, {torch.nn.Linear, torch.nn.Conv2d}, dtype=torch.qint8
+        )
+    
+    # Set to evaluation mode
+    inference_model.eval()
+    inference_model.to(args.device)
+    
+    return inference_model
 
 
 def get_dataset_paths(root):
@@ -143,39 +333,13 @@ def create_test_manifest(prep_dir: pathlib.Path, manifest_path: pathlib.Path):
     return manifest_path
 
 
-def evaluate_model(model_path, test_manifest, args):
+def evaluate_model(model_path, test_manifest, args, model_type="lightning"):
     """Evaluate a trained VAD model and return frame-level predictions and labels."""
-    logger.info(f"Loading model from {model_path}")
+    logger.info(f"Evaluating {model_type} model: {model_path}")
 
-    # Load model with custom way to handle hyperparameters
-    try:
-        # First try standard loading
-        model = VADLightning.load_from_checkpoint(model_path)
-    except (AttributeError, TypeError) as e:
-        # If we get dictionary error or missing argument error, load with a workaround
-        logger.info(f"Standard loading failed with error: {e}, trying with hyperparameter conversion")
-
-        # Load the checkpoint directly
-        checkpoint = torch.load(model_path, map_location=args.device)
-        hparams = checkpoint.get("hyper_parameters", {})
-
-        # Convert dict to argparse.Namespace to match expected format
-        import argparse
-
-        hp_namespace = argparse.Namespace(**hparams)
-
-        # Create model with converted namespace
-        model = VADLightning(hp_namespace)
-
-        # Load state dict
-        model.load_state_dict(checkpoint["state_dict"])
-        logger.info("Model loaded with hyperparameter conversion")
-
-    model.eval()
-    model.to(args.device)
-    logger.info(f"Model loaded to {args.device}")
-
-    # Rest of the function remains the same
+    # Load the model based on its type
+    model = load_model_by_type(model_path, args, model_type)
+    
     # Create test dataset
     logger.info(f"Creating test dataset from {test_manifest}")
     test_dataset = CSVMelDataset(
@@ -195,43 +359,27 @@ def evaluate_model(model_path, test_manifest, args):
         num_workers=args.num_workers,
         collate_fn=lambda batch: collate_pad(batch, args.max_frames),
     )
-    logger.info(f"Evaluating model on {len(test_dataset)} test samples")
+    logger.info(f"Evaluating model on {len(test_dataset)} test samples with {len(test_loader)} batches")
 
-    # Evaluate
-    all_preds = []
-    all_labels = []
-    all_clip_labels = []
+    # Use optimized batch processing
+    batch_results = process_batch(model, test_loader, args.device)
+    
+    # Extract and concatenate all results
+    all_frame_preds = []
+    all_frame_labels = []
     all_clip_preds = []
-
-    with torch.no_grad():
-        for batch_idx, (mel, labels, mask) in enumerate(test_loader):
-            if batch_idx % 10 == 0:
-                logger.info(f"Processing batch {batch_idx}/{len(test_loader)}")
-
-            mel = mel.to(args.device)
-            logits = model(mel)
-            preds = torch.sigmoid(logits)
-
-            # Use mask to extract valid frames only
-            for i in range(mel.shape[0]):
-                valid_frames = mask[i].sum().item()
-                sample_preds = preds[i, :valid_frames].cpu().numpy()
-                sample_labels = labels[i, :valid_frames].cpu().numpy()
-
-                all_preds.append(sample_preds)
-                all_labels.append(sample_labels)
-
-                # Calculate clip-level prediction (average of frame predictions)
-                clip_pred = sample_preds.mean()
-                # Determine clip-level ground truth (if any frame is 1, clip is positive)
-                clip_label = 1.0 if sample_labels.max() > 0.5 else 0.0
-
-                all_clip_preds.append(clip_pred)
-                all_clip_labels.append(clip_label)
-
+    all_clip_labels = []
+    
+    for batch in batch_results:
+        for sample in batch:
+            all_frame_preds.append(sample["frame_preds"])
+            all_frame_labels.append(sample["frame_labels"])
+            all_clip_preds.append(sample["clip_pred"])
+            all_clip_labels.append(sample["clip_label"])
+    
     # Concatenate results
-    frame_preds = np.concatenate(all_preds)
-    frame_labels = np.concatenate(all_labels)
+    frame_preds = np.concatenate(all_frame_preds)
+    frame_labels = np.concatenate(all_frame_labels)
     clip_preds = np.array(all_clip_preds)
     clip_labels = np.array(all_clip_labels)
 
@@ -267,30 +415,115 @@ def find_segments(binary_sequence):
     return segments
 
 
-def analyze_speech_boundaries(
-    frame_preds, frame_labels, threshold=0.5, tolerance_frames=3
-):
-    """Analyze speech boundary detection performance.
+def plot_smoothing_effect(frame_preds, frame_labels, output_dir):
+    """Visualize the effect of smoothing on a sample portion of audio."""
+    # Take a sample portion (1000 frames) where there's speech and silence
+    has_speech = frame_labels.sum(axis=0) > 0
+    sample_start = np.where(has_speech)[0][0] - 100
+    sample_start = max(0, sample_start)
+    sample_end = min(len(frame_preds), sample_start + 1000)
+    
+    sample_preds = frame_preds[sample_start:sample_end]
+    sample_labels = frame_labels[sample_start:sample_end]
+    
+    # Apply smoothing
+    _, smoothed = smooth_predictions(sample_preds, window_size=5)
+    binary_preds = (sample_preds > 0.5).astype(int)
+    binary_smooth = (smoothed > 0.5).astype(int)
+    
+    # Plot
+    plt.figure(figsize=(15, 8))
+    plt.subplot(3, 1, 1)
+    plt.plot(sample_preds, label='Raw Predictions')
+    plt.plot(smoothed, label='Smoothed Predictions')
+    plt.axhline(y=0.5, color='r', linestyle='--', alpha=0.7)
+    plt.legend()
+    plt.title('Raw vs Smoothed Predictions')
+    
+    plt.subplot(3, 1, 2)
+    plt.step(range(len(binary_preds)), binary_preds, label='Binary Raw')
+    plt.step(range(len(binary_smooth)), binary_smooth, label='Binary Smoothed')
+    plt.step(range(len(sample_labels)), sample_labels, label='Ground Truth', linestyle=':')
+    plt.legend()
+    plt.title('Binary Decisions')
+    
+    plt.subplot(3, 1, 3)
+    plt.step(range(len(binary_preds)), binary_preds != sample_labels, label='Raw Errors')
+    plt.step(range(len(binary_smooth)), binary_smooth != sample_labels, label='Smoothed Errors')
+    plt.legend()
+    plt.title('Error Locations (1=error)')
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / "smoothing_effect.png", dpi=300)
+    plt.close()
 
-    Args:
-        frame_preds: Frame-level prediction scores (0-1)
-        frame_labels: Ground truth frame labels (0 or 1)
-        threshold: Classification threshold
-        tolerance_frames: Number of frames allowed for boundary error
+def smooth_predictions_with_hysteresis(frame_preds, window_size=7, high_threshold=0.6, low_threshold=0.4):
+    """Apply hysteresis thresholding for better boundary detection."""
+    from scipy.ndimage import median_filter
+    
+    # First smooth the predictions with median filtering
+    smoothed = median_filter(frame_preds, size=window_size)
+    
+    # Apply hysteresis thresholding
+    binary = np.zeros_like(smoothed, dtype=int)
+    in_segment = False
+    
+    for i in range(len(smoothed)):
+        if not in_segment and smoothed[i] >= high_threshold:
+            # Start of segment (using higher threshold)
+            in_segment = True
+            binary[i] = 1
+        elif in_segment and smoothed[i] >= low_threshold:
+            # Continue segment (using lower threshold)
+            binary[i] = 1
+        elif in_segment and smoothed[i] < low_threshold:
+            # End of segment
+            in_segment = False
+    
+    return binary
 
-    Returns:
-        Dictionary of boundary metrics
-    """
+def analyze_speech_boundaries(frame_preds, frame_labels, threshold=0.5, args=None, output_dir=None):
+    """Analyze speech boundary detection performance."""
     logger.info("Analyzing speech boundary detection performance")
     boundary_metrics = {}
-
-    # Convert to binary predictions
-    binary_preds = (frame_preds > threshold).astype(int)
-
-    # Group frame sequences by continuous clips
-    # For this demo, we'll assume all frames are from a single continuous sequence
-    # In a real implementation, you'd need to process each clip separately
-
+    
+    # Safely handle output_dir
+    if output_dir is None:
+        if args and hasattr(args, 'output_dir'):
+            output_dir = pathlib.Path(args.output_dir)
+        else:
+            output_dir = pathlib.Path("evaluation_results")
+    else:
+        output_dir = pathlib.Path(output_dir)
+    
+    # Ensure output directory exists
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Default values when args is None
+    sample_rate = getattr(args, 'sample_rate', 16000) if args else 16000
+    hop = getattr(args, 'hop', 160) if args else 160
+    smoothing_window_ms = getattr(args, 'smoothing_window_ms', 50) if args else 50
+    min_segment_duration_ms = getattr(args, 'min_segment_duration_ms', 150) if args else 150  # Changed from 200ms to 150ms
+    max_gap_duration_ms = getattr(args, 'max_gap_duration_ms', 150) if args else 150  # Changed from 100ms to 150ms
+    
+    # Convert time-based parameters to frames
+    frames_per_second = sample_rate / hop
+    smoothing_window = max(3, int(smoothing_window_ms * frames_per_second / 1000))
+    min_segment_frames = max(1, int(min_segment_duration_ms * frames_per_second / 1000))
+    max_gap_frames = max(1, int(max_gap_duration_ms * frames_per_second / 1000))
+    
+    logger.info(f"Using smoothing window: {smoothing_window} frames ({smoothing_window_ms}ms)")
+    logger.info(f"Min segment duration: {min_segment_frames} frames ({min_segment_duration_ms}ms)")
+    logger.info(f"Max gap: {max_gap_frames} frames ({max_gap_duration_ms}ms)")
+    
+    # Use hysteresis thresholding instead of simple thresholding
+    binary_preds = smooth_predictions_with_hysteresis(
+        frame_preds, 
+        window_size=smoothing_window, 
+        high_threshold=threshold+0.15,  # Increase from 0.1 to 0.15
+        low_threshold=threshold-0.08    # Asymmetric threshold for better detection
+    )
+    
     # Find true speech segments
     true_segments = find_segments(frame_labels > 0.5)
     logger.info(f"Found {len(true_segments)} true speech segments")
@@ -298,6 +531,20 @@ def analyze_speech_boundaries(
     # Find predicted speech segments
     pred_segments = find_segments(binary_preds)
     logger.info(f"Found {len(pred_segments)} predicted speech segments")
+    
+    # Apply filtering and merging
+    pred_segments = filter_short_segments(pred_segments, min_duration=min_segment_frames)
+
+    avg_true_duration = np.mean([end-start+1 for start, end in true_segments])
+    if avg_true_duration > 50:  # Long segments in dataset
+        # More aggressive merging for datasets with longer segments
+        pred_segments = merge_short_gaps(pred_segments, max_gap_size=max_gap_frames*1.5)
+    else:
+        # Standard merging for datasets with shorter segments
+        pred_segments = merge_short_gaps(pred_segments, max_gap_size=max_gap_frames)
+
+    logger.info(f"After merging: {len(pred_segments)} predicted segments")
+    
 
     # Count matched segments (with overlap)
     matched_true_segments = 0
@@ -332,7 +579,7 @@ def analyze_speech_boundaries(
                     best_pred_segment = (pred_start, pred_end)
 
         # If we found a matching segment
-        if best_iou > 0.5:  # Consider it a match if IoU > 0.5
+        if best_iou > 0.4:  # Consider it a match if IoU > 0.5
             matched_true_segments += 1
 
             # Calculate boundary errors
@@ -391,19 +638,133 @@ def analyze_speech_boundaries(
     else:
         boundary_metrics["segment_f1"] = 0.0
 
-    # Boundary timing metrics
     if onset_errors:
-        boundary_metrics["mean_onset_error"] = np.mean(onset_errors)
-        boundary_metrics["mean_abs_onset_error"] = np.mean(np.abs(onset_errors))
-        boundary_metrics["max_onset_error"] = np.max(np.abs(onset_errors))
+        boundary_metrics["mean_onset_error"] = float(np.mean(onset_errors))
+        boundary_metrics["mean_abs_onset_error"] = float(np.mean(np.abs(onset_errors)))
+        # Safely handle max value 
+        max_error = np.max(np.abs(onset_errors))
+        if np.isfinite(max_error):
+            boundary_metrics["max_onset_error"] = float(max_error)
+        else:
+            boundary_metrics["max_onset_error"] = "Infinity"  # Use string for non-finite values
 
+    # Similarly for offset errors
     if offset_errors:
-        boundary_metrics["mean_offset_error"] = np.mean(offset_errors)
-        boundary_metrics["mean_abs_offset_error"] = np.mean(np.abs(offset_errors))
-        boundary_metrics["max_offset_error"] = np.max(np.abs(offset_errors))
+        boundary_metrics["mean_offset_error"] = float(np.mean(offset_errors))
+        boundary_metrics["mean_abs_offset_error"] = float(np.mean(np.abs(offset_errors)))
+        max_error = np.max(np.abs(offset_errors))
+        if np.isfinite(max_error):
+            boundary_metrics["max_offset_error"] = float(max_error)
+        else:
+            boundary_metrics["max_offset_error"] = "Infinity"
+
+    frames_per_second = args.sample_rate / args.hop
+
+    # Generate duration distribution plots
+    duration_stats = plot_segment_durations(
+        true_segments, pred_segments, output_dir or pathlib.Path(args.output_dir), frames_per_second
+    )
+
+    # Add duration statistics to boundary metrics
+    boundary_metrics["duration_stats"] = duration_stats
+
+    # Calculate frame duration in milliseconds
+    frame_ms = 1000 * args.hop / args.sample_rate
+
+    # Add detection latency analysis
+    latency_metrics = analyze_detection_latency(
+        true_segments, pred_segments,output_dir or pathlib.Path(args.output_dir), frame_ms=frame_ms
+    )
+    boundary_metrics["latency"] = latency_metrics
+
+    # Print latency results
+    if "mean_latency_ms" in latency_metrics:
+        logger.info(f"Mean speech onset detection latency: {latency_metrics['mean_latency_ms']:.1f} ms")
+        logger.info(f"Detection rate: {latency_metrics['detection_rate']*100:.1f}% " +
+                f"({latency_metrics['detected_segments']}/{latency_metrics['total_segments']} segments)")
 
     return boundary_metrics
 
+def analyze_detection_latency(true_segments, pred_segments, output_dir, frame_ms=10):
+    """Analyze speech onset detection latency."""
+    logger.info("Analyzing speech onset detection latency")
+    
+    # Ensure output_dir is a Path
+    output_dir = pathlib.Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    onset_delays = []  # Will contain latency for each detected speech segment (in ms)
+    matched_segments = 0
+    undetected_segments = 0
+    
+    for true_start, true_end in true_segments:
+        # Find if this true segment was detected
+        detected = False
+        min_delay = float('inf')
+        
+        for pred_start, pred_end in pred_segments:
+            # Check if there's reasonable overlap (at least 40% of true segment)
+            overlap_start = max(true_start, pred_start)
+            overlap_end = min(true_end, pred_end)
+            
+            if overlap_start <= overlap_end:
+                overlap_duration = overlap_end - overlap_start + 1
+                true_duration = true_end - true_start + 1
+                
+                # If reasonable overlap - reduced from 50% to 40%
+                if overlap_duration >= 0.4 * true_duration:
+                    detected = True
+                    # Calculate onset delay - how long after true onset did we detect it?
+                    delay = pred_start - true_start 
+                    
+                    # Keep only the earliest detection
+                    if delay < min_delay:
+                        min_delay = delay
+            
+        if detected:
+            matched_segments += 1
+            # Convert frames to milliseconds
+            onset_delays.append(min_delay * frame_ms)
+        else:
+            undetected_segments += 1
+    
+    # Filter out extreme outliers (beyond 3 seconds early/late)
+    filtered_delays = [d for d in onset_delays if abs(d) < 3000]
+    
+    # Calculate statistics
+    results = {
+        "total_segments": len(true_segments),
+        "detected_segments": matched_segments,
+        "undetected_segments": undetected_segments,
+        "detection_rate": matched_segments / len(true_segments) if len(true_segments) > 0 else 0,
+        "filtered_outliers": len(onset_delays) - len(filtered_delays)
+    }
+    
+    if filtered_delays:
+        results.update({
+            "mean_latency_ms": float(np.mean(filtered_delays)),
+            "median_latency_ms": float(np.median(filtered_delays)),
+            "min_latency_ms": float(np.min(filtered_delays)),
+            "max_latency_ms": float(np.max(filtered_delays))
+        })
+        
+        # Create latency histogram visualization
+        plt.figure(figsize=(12, 6))
+        plt.hist(filtered_delays, bins=30)
+        plt.axvline(x=np.mean(filtered_delays), color='r', linestyle='--', 
+                  label=f'Mean: {np.mean(filtered_delays):.1f} ms')
+        plt.axvline(x=np.median(filtered_delays), color='g', linestyle='--', 
+                  label=f'Median: {np.median(filtered_delays):.1f} ms')
+        plt.xlabel('Detection Latency (ms)')
+        plt.ylabel('Count')
+        plt.title('Speech Onset Detection Latency')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(output_dir / "onset_latency.png", dpi=300)
+        plt.close()
+    
+    return results
 
 def plot_transition_errors(
     frame_preds, frame_labels, output_dir, threshold=0.5, window=10
@@ -608,16 +969,31 @@ def plot_metrics(
     # 5. Threshold vs Metrics
     logger.info("Plotting frame-level threshold vs metrics")
     # Calculate metrics at various thresholds
-    thresholds_for_plot = np.linspace(0, 1, 100)
+    thresholds_for_plot = np.linspace(0, 1, 20)  # Reduced from 100 to 20 points
     f1_values = []
     precision_values = []
     recall_values = []
 
-    for threshold in thresholds_for_plot:
-        prec = precision_score(frame_labels, binary_preds, zero_division=0)
-        rec = recall_score(frame_labels, binary_preds, zero_division=0)
-        f1 = f1_score(frame_labels, binary_preds)
+    # Use sampling for large datasets to speed up calculation
+    if len(frame_labels) > 100000:
+        logger.info(f"Sampling 100,000 frames for threshold metrics (from {len(frame_labels)} total)")
+        sample_indices = np.random.choice(len(frame_labels), 100000, replace=False)
+        sample_preds = frame_preds[sample_indices]
+        sample_labels = frame_labels[sample_indices]
+    else:
+        sample_preds = frame_preds
+        sample_labels = frame_labels
 
+    # Calculate metrics for each threshold
+    for threshold in thresholds_for_plot:
+        # Create new binary predictions for each threshold
+        binary_preds = (sample_preds >= threshold).astype(int)
+        
+        # Calculate metrics with these predictions
+        prec = precision_score(sample_labels, binary_preds, zero_division=0)
+        rec = recall_score(sample_labels, binary_preds, zero_division=0)
+        f1 = f1_score(sample_labels, binary_preds)
+        
         precision_values.append(prec)
         recall_values.append(rec)
         f1_values.append(f1)
@@ -757,6 +1133,7 @@ def plot_metrics(
         "Clip F1",
     ]
 
+
     metrics_values = [roc_auc, pr_auc, frame_f1, clip_roc_auc, clip_pr_auc, clip_f1]
 
     plt.figure(figsize=(12, 8))
@@ -797,14 +1174,172 @@ def plot_metrics(
         },
     }
 
+    # Calculate advanced metrics
+    advanced_metrics = calculate_advanced_metrics(
+        frame_preds, frame_labels, optimal_threshold
+    )
+
+    # Add them to the metrics dictionary
+    metrics["frame_level"].update({
+        "false_alarm_rate": float(advanced_metrics["false_alarm_rate"]),
+        "miss_detection_rate": float(advanced_metrics["miss_detection_rate"]),
+        "precision_at_recall90": float(advanced_metrics["precision_at_recall90"])
+    })
+
+    # Create a visualization of false alarm vs miss rates
+    plt.figure(figsize=(10, 8))
+    thresholds_for_plot = np.linspace(0, 1, 100)
+    far_values = []
+    mdr_values = []
+
+    for t in thresholds_for_plot:
+        advanced = calculate_advanced_metrics(frame_preds, frame_labels, t)
+        far_values.append(advanced["false_alarm_rate"])
+        mdr_values.append(advanced["miss_detection_rate"])
+
+    plt.plot(far_values, mdr_values, 'b-')
+    plt.plot(advanced_metrics["false_alarm_rate"], advanced_metrics["miss_detection_rate"], 
+            'ro', markersize=10, label=f'Operating point (t={optimal_threshold:.3f})')
+
+    plt.xlabel('False Alarm Rate')
+    plt.ylabel('Miss Detection Rate')
+    plt.title('Miss vs False Alarm Rate Trade-off')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "miss_false_alarm_tradeoff.png", dpi=300)
+    plt.close()
+
     with open(output_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=4)
 
     logger.info(f"All visualizations saved to {output_dir}")
     logger.info(f"Metrics: {metrics}")
 
+    print(f"\n✅ Evaluation complete!")
+    print(f"📊 Frame-level metrics:")
+    print(f"  - ROC AUC: {metrics['frame_level']['roc_auc']:.4f}")
+    print(f"  - PR AUC: {metrics['frame_level']['pr_auc']:.4f}")
+    print(f"  - F1 score: {metrics['frame_level']['f1_score']:.4f}")
+    print(f"  - False alarm rate: {metrics['frame_level'].get('false_alarm_rate', 'N/A'):.4f}")
+    print(f"  - Miss detection rate: {metrics['frame_level'].get('miss_detection_rate', 'N/A'):.4f}")
+    print(f"  - Precision@90% Recall: {metrics['frame_level'].get('precision_at_recall90', 'N/A'):.4f}")
+    print(f"  - Optimal threshold: {metrics['frame_level']['optimal_threshold']:.4f}")
+
     return metrics
 
+def plot_segment_durations(true_segments, pred_segments, output_dir, frames_per_second):
+    """Plot histograms of segment durations."""
+    logger.info("Creating segment duration distribution plot")
+    
+    # Ensure output_dir is a Path 
+    output_dir = pathlib.Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Calculate durations in seconds
+    true_durations = [(end-start+1)/frames_per_second for start, end in true_segments]
+    pred_durations = [(end-start+1)/frames_per_second for start, end in pred_segments]
+    
+    plt.figure(figsize=(12, 8))
+    
+    # Primary plot - histogram
+    plt.subplot(2, 1, 1)
+    plt.hist(true_durations, bins=20, alpha=0.5, label="True segments")
+    plt.hist(pred_durations, bins=20, alpha=0.5, label="Predicted segments")
+    plt.xlabel("Duration (seconds)")
+    plt.ylabel("Count")
+    plt.title("Speech Segment Duration Distribution")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Secondary plot - boxplot for comparison
+    plt.subplot(2, 1, 2)
+    box_data = [true_durations, pred_durations]
+    plt.boxplot(box_data, labels=["True segments", "Predicted segments"])
+    plt.ylabel("Duration (seconds)")
+    plt.title("Segment Duration Comparison")
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / "segment_durations.png", dpi=300)
+    plt.close()
+    
+    # Calculate and return statistics
+    stats = {
+        "true_segments": {
+            "count": len(true_durations),
+            "mean_duration": np.mean(true_durations) if true_durations else 0,
+            "median_duration": np.median(true_durations) if true_durations else 0,
+            "min_duration": min(true_durations) if true_durations else 0,
+            "max_duration": max(true_durations) if true_durations else 0,
+        },
+        "pred_segments": {
+            "count": len(pred_durations),
+            "mean_duration": np.mean(pred_durations) if pred_durations else 0,
+            "median_duration": np.median(pred_durations) if pred_durations else 0,
+            "min_duration": min(pred_durations) if pred_durations else 0,
+            "max_duration": max(pred_durations) if pred_durations else 0,
+        }
+    }
+    
+    return stats
+
+# Add after other metrics functions (around line 730)
+
+def calculate_advanced_metrics(frame_preds, frame_labels, threshold):
+    """Calculate advanced metrics for VAD including miss/false alarm rates."""
+    binary_preds = (frame_preds >= threshold).astype(int)
+    
+    # True/False Positive/Negative counts
+    tp = np.sum((binary_preds == 1) & (frame_labels == 1))
+    tn = np.sum((binary_preds == 0) & (frame_labels == 0))
+    fp = np.sum((binary_preds == 1) & (frame_labels == 0))
+    fn = np.sum((binary_preds == 0) & (frame_labels == 1))
+    
+    # Basic metrics
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    
+    # Additional metrics
+    false_alarm_rate = fp / (fp + tn) if (fp + tn) > 0 else 0
+    miss_detection_rate = fn / (fn + tp) if (fn + tp) > 0 else 0
+    
+    # Precision at specific recall levels
+    precisions, recalls, thresholds = precision_recall_curve(frame_labels, frame_preds)
+    
+    # Interpolate precision at 90% recall
+    p_at_r90 = 0
+    for i in range(len(recalls) - 1):
+        if recalls[i] >= 0.9 >= recalls[i + 1]:
+            # Linear interpolation
+            p_at_r90 = precisions[i] + (precisions[i + 1] - precisions[i]) * \
+                      (0.9 - recalls[i]) / (recalls[i + 1] - recalls[i])
+            break
+    
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "false_alarm_rate": false_alarm_rate,
+        "miss_detection_rate": miss_detection_rate, 
+        "precision_at_recall90": p_at_r90
+    }
+
+def merge_nearby_segments(segments, max_gap=3):
+    """Merge segments separated by small gaps."""
+    if not segments:
+        return []
+    sorted_segments = sorted(segments, key=lambda x: x[0])
+    merged = [sorted_segments[0]]
+    for current in sorted_segments[1:]:
+        prev_start, prev_end = merged[-1]
+        curr_start, curr_end = current
+        if curr_start - prev_end <= max_gap:
+            merged[-1] = (prev_start, max(prev_end, curr_end))
+        else:
+            merged.append(current)
+    return merged
 
 def main():
     logger.info("Starting VAD evaluation script")
@@ -887,6 +1422,20 @@ def main():
         default=DEFAULT_CACHE_DIR,
         help="Directory to cache mel spectrograms",
     )
+    # Add these arguments in the main function's argument parser
+    parser.add_argument(
+        "--pytorch_model", 
+        help="Path to PyTorch model (.pt) for evaluation"
+    )
+    parser.add_argument(
+        "--quantized_model", 
+        help="Path to quantized model (_quantized.pt) for evaluation"
+    )
+    parser.add_argument(
+        "--compare_models", 
+        action="store_true",
+        help="Compare performance between original and quantized models"
+    )
     # Output arguments
     parser.add_argument(
         "--output_dir",
@@ -918,6 +1467,22 @@ def main():
         type=int,
         default=10,
         help="Window size (frames) for transition analysis",
+    )
+    parser.add_argument(
+        "--smoothing_window_ms", type=int, default=50, 
+        help="Window size for median filtering (in milliseconds)"
+    )
+    parser.add_argument(
+        "--min_segment_duration_ms", type=int, default=200, 
+        help="Minimum speech segment duration (in milliseconds)"
+    )
+    parser.add_argument(
+        "--max_gap_duration_ms", type=int, default=100, 
+        help="Maximum gap between segments to merge (in milliseconds)"
+    )
+    parser.add_argument(
+        "--iou_threshold", type=float, default=0.5,
+        help="IoU threshold for segment matching"
     )
 
     args = parser.parse_args()
@@ -1030,12 +1595,21 @@ def main():
         # Use threshold from metrics for consistency
         threshold = metrics["frame_level"]["optimal_threshold"]
         boundary_metrics = analyze_speech_boundaries(
-            test_frame_preds, test_frame_labels, threshold=threshold
+            test_frame_preds, test_frame_labels, threshold=threshold, args=args
         )
 
         # Save boundary metrics
-        with open(output_dir / "boundary_metrics.json", "w") as f:
-            json.dump(boundary_metrics, f, indent=4)
+        try:
+            with open(output_dir / "boundary_metrics.json", "w") as f:
+                json.dump(boundary_metrics, f, indent=4)
+        except Exception as e:
+            logger.error(f"Error saving boundary metrics: {e}")
+            # Create a simpler version without problematic values
+            simple_metrics = {k: v for k, v in boundary_metrics.items() 
+                            if isinstance(v, (int, float, str)) and 
+                                (not isinstance(v, float) or (not np.isnan(v) and not np.isinf(v)))}
+            with open(output_dir / "boundary_metrics_safe.json", "w") as f:
+                json.dump(simple_metrics, f, indent=4)
 
         # Plot transition error patterns
         plot_transition_errors(
@@ -1046,6 +1620,13 @@ def main():
             window=args.transition_window,
         )
 
+        if "latency" in boundary_metrics:
+            lat = boundary_metrics["latency"]
+            if "mean_latency_ms" in lat:
+                print(f"  - Mean onset latency: {lat['mean_latency_ms']:.1f} ms")
+                print(f"  - Detection rate: {lat['detection_rate']*100:.1f}% " +
+                    f"({lat['detected_segments']}/{lat['total_segments']} segments)")
+                
         # Print boundary metrics
         print(f"\n🔍 Boundary Detection Analysis:")
         print(f"  - Segment F1 Score: {boundary_metrics.get('segment_f1', 'N/A'):.4f}")
@@ -1061,6 +1642,102 @@ def main():
             print(
                 f"  - Mean offset error: {boundary_metrics['mean_abs_offset_error']:.2f} frames"
             )
+
+
+    # Store results from different model evaluations
+    results = {}
+    
+    # Check if we have metrics from the standard evaluation
+    if args.model_path and 'metrics' in locals():
+        # Only store if metrics was actually defined (meaning evaluation succeeded)
+        results["lightning"] = metrics
+    
+    # If pytorch_model is specified, evaluate it
+    if args.pytorch_model:
+        if not pathlib.Path(args.pytorch_model).exists():
+            logger.error(f"PyTorch model missing: {args.pytorch_model}")
+        else:
+            logger.info(f"Evaluating PyTorch model: {args.pytorch_model}")
+            frame_preds, frame_labels, clip_preds, clip_labels = evaluate_model(
+                args.pytorch_model, args.test_manifest, args, model_type="pytorch"
+            )
+            
+            pt_metrics = plot_metrics(
+                frame_preds, frame_labels, clip_preds, clip_labels, 
+                output_dir / "pytorch_model"
+            )
+            results["pytorch"] = pt_metrics
+    
+    # If quantized_model is specified, evaluate it
+    if args.quantized_model:
+        if not pathlib.Path(args.quantized_model).exists():
+            logger.error(f"Quantized model missing: {args.quantized_model}")
+        else:
+            logger.info(f"Evaluating quantized model: {args.quantized_model}")
+            frame_preds, frame_labels, clip_preds, clip_labels = evaluate_model(
+                args.quantized_model, args.test_manifest, args, model_type="quantized"
+            )
+            
+            quant_metrics = plot_metrics(
+                frame_preds, frame_labels, clip_preds, clip_labels, 
+                output_dir / "quantized_model"
+            )
+            results["quantized"] = quant_metrics
+    
+    # If multiple models were evaluated and comparison was requested, create a comparison
+    if args.compare_models and len(results) > 1:
+        logger.info("Comparing model performances")
+        
+        # Create comparison table
+        comparison = {
+            "frame_f1": {},
+            "frame_auc": {},
+            "clip_f1": {},
+            "clip_auc": {},
+        }
+        
+        for model_type, metrics in results.items():
+            comparison["frame_f1"][model_type] = metrics["frame_level"]["f1_score"]
+            comparison["frame_auc"][model_type] = metrics["frame_level"]["roc_auc"]
+            comparison["clip_f1"][model_type] = metrics["clip_level"]["f1_score"]
+            comparison["clip_auc"][model_type] = metrics["clip_level"]["roc_auc"]
+        
+        # Save comparison to JSON
+        with open(output_dir / "model_comparison.json", "w") as f:
+            json.dump(comparison, f, indent=4)
+        
+        # Print comparison
+        print("\n📊 Model Performance Comparison:")
+        for metric, values in comparison.items():
+            print(f"\n{metric.upper()}:")
+            for model_type, value in values.items():
+                print(f"  - {model_type}: {value:.4f}")
+        
+        # Create comparison bar chart
+        plt.figure(figsize=(12, 8))
+        
+        # Plot F1 scores
+        x = np.arange(len(comparison))
+        width = 0.35
+        
+        models = list(next(iter(comparison.values())).keys())
+        metrics = list(comparison.keys())
+        
+        for i, model_type in enumerate(models):
+            values = [comparison[metric][model_type] for metric in metrics]
+            plt.bar(x + i*width, values, width, label=model_type)
+        
+        plt.xlabel('Metric')
+        plt.ylabel('Score')
+        plt.title('Model Performance Comparison')
+        plt.xticks(x + width/2, metrics)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(output_dir / "model_comparison.png", dpi=300)
+        plt.close()
+
+    # Print summary
+    print(f"\n✅ Evaluation complete!")
 
     # Print summary
     print(f"\n✅ Evaluation complete!")

@@ -156,30 +156,40 @@ def setup_eval_parser(subparsers):
     """Setup the evaluation command parser."""
     parser = subparsers.add_parser("evaluate", help="Evaluate a trained VAD model")
 
-    # Model and data
+    # Data preparation arguments
     parser.add_argument(
-        "--model_path", required=True, help="Path to trained model checkpoint"
+        "--test_root", default="datasets", help="Root directory for test data"
     )
     parser.add_argument(
-        "--test_root", default=DEFAULT_ROOT_DIR, help="Root directory for test data"
-    )
-    parser.add_argument(
-        "--test_manifest",
-        help="Path to test manifest CSV (created automatically if not provided)",
+        "--prepare_data", action="store_true", help="Download and prepare test data"
     )
     parser.add_argument(
         "--n_test",
         type=int,
-        default=500,
-        help="Number of test samples to generate (if preparing data)",
+        default=1000,
+        help="Number of test samples to generate (each for positive and negative)",
     )
     parser.add_argument(
-        "--prepare_data",
-        action="store_true",
-        help="Prepare test data before evaluation",
+        "--duration_range",
+        type=float,
+        nargs=2,
+        default=[5, 10],
+        help="Min and max duration in seconds for audio clips",
+    )
+    parser.add_argument(
+        "--sample_rate",
+        type=int,
+        default=DEFAULT_SAMPLE_RATE,
+        help="Sample rate for audio processing",
     )
 
-    # Mel parameters
+    # Model and evaluation arguments
+    parser.add_argument(
+        "--model_path", required=True, help="Path to trained model checkpoint"
+    )
+    parser.add_argument(
+        "--test_manifest", help="Path to test manifest CSV (if already created)"
+    )
     parser.add_argument(
         "--n_mels",
         type=int,
@@ -192,23 +202,16 @@ def setup_eval_parser(subparsers):
     parser.add_argument(
         "--hop", type=int, default=DEFAULT_HOP_LENGTH, help="Hop length for spectrogram"
     )
-
-    # Evaluation settings
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to run evaluation on",
+    )
     parser.add_argument(
         "--batch_size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
         help="Batch size for evaluation",
-    )
-    parser.add_argument(
-        "--device",
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run evaluation on (cuda/cpu)",
-    )
-    parser.add_argument(
-        "--output_dir",
-        default="eval_results",
-        help="Directory to save evaluation results",
     )
     parser.add_argument(
         "--num_workers", type=int, default=4, help="Number of data loading workers"
@@ -219,31 +222,40 @@ def setup_eval_parser(subparsers):
         default=DEFAULT_MAX_FRAMES,
         help="Maximum number of frames per sequence",
     )
-
-    # Caching
     parser.add_argument(
         "--use_mel_cache",
         action="store_true",
-        help="Use cached mel spectrograms if available",
+        help="Cache mel spectrograms for faster processing",
     )
     parser.add_argument(
         "--mel_cache_dir",
         default=DEFAULT_CACHE_DIR,
-        help="Directory for cached mel spectrograms",
+        help="Directory to cache mel spectrograms",
     )
-    
-    # Add boundary analysis parameters
+    # Add these arguments in the main function's argument parser
     parser.add_argument(
-        "--boundary_analysis",
+        "--pytorch_model", 
+        help="Path to PyTorch model (.pt) for evaluation"
+    )
+    parser.add_argument(
+        "--quantized_model", 
+        help="Path to quantized model (_quantized.pt) for evaluation"
+    )
+    parser.add_argument(
+        "--compare_models", 
         action="store_true",
-        help="Perform detailed speech boundary detection analysis",
+        help="Compare performance between original and quantized models"
+    )
+    # Output arguments
+    parser.add_argument(
+        "--output_dir",
+        default="evaluation_results",
+        help="Directory to save evaluation results",
     )
     parser.add_argument(
-        "--transition_window",
-        type=int,
-        default=10,
-        help="Window size (frames) for transition analysis",
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
+    # Add after other parser arguments
     parser.add_argument(
         "--two_stage_eval",
         action="store_true",
@@ -256,7 +268,31 @@ def setup_eval_parser(subparsers):
         help="Number of validation samples for threshold tuning",
     )
     parser.add_argument(
-        "--seed", type=int, default=42, help="Random seed for reproducibility"
+        "--boundary_analysis",
+        action="store_true",
+        help="Perform detailed speech boundary detection analysis",
+    )
+    parser.add_argument(
+        "--transition_window",
+        type=int,
+        default=10,
+        help="Window size (frames) for transition analysis",
+    )
+    parser.add_argument(
+        "--smoothing_window_ms", type=int, default=50, 
+        help="Window size for median filtering (in milliseconds)"
+    )
+    parser.add_argument(
+        "--min_segment_duration_ms", type=int, default=200, 
+        help="Minimum speech segment duration (in milliseconds)"
+    )
+    parser.add_argument(
+        "--max_gap_duration_ms", type=int, default=100, 
+        help="Maximum gap between segments to merge (in milliseconds)"
+    )
+    parser.add_argument(
+        "--iou_threshold", type=float, default=0.5,
+        help="IoU threshold for segment matching"
     )
 
     return parser
@@ -371,6 +407,10 @@ def main():
                 if isinstance(arg_value, bool):
                     if arg_value:
                         sys.argv.append(f"--{arg_name}")
+                elif isinstance(arg_value, list):  # Handle list arguments like duration_range
+                    sys.argv.append(f"--{arg_name}")
+                    for item in arg_value:
+                        sys.argv.append(str(item))
                 elif arg_value is not None:
                     sys.argv.append(f"--{arg_name}")
                     sys.argv.append(str(arg_value))

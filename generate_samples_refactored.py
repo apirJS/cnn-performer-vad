@@ -3,7 +3,6 @@ import random
 import time
 import numpy as np
 import soundfile as sf
-import librosa
 from utils import logger
 from tqdm import tqdm
 
@@ -16,9 +15,9 @@ from prepare_data import (
     ingest_fleurs,
     validate_audio_sample,
     validate_negative_audio_sample,
-    generate_silero_vad_labels,
     create_clean_speech_sample_with_silero,
     create_overlapping_speech_with_silero,
+    create_speech_noise_sample_with_silero,
     create_speech_music_sample_with_silero,
     create_speech_noise_music_sample_with_silero,
     create_esc50_negative_sample,
@@ -32,184 +31,13 @@ from prepare_data import (
 from utils import (
     stratified_fleurs_sample,
     stratified_librispeech_sample,
-    apply_eq,
-    add_reverb,
-    load_and_process_audio,
 )
 
-# Assuming these are defined elsewhere or should be passed/configured
-# For example:
-# from your_project.config import DEFAULT_HOP_LENGTH, DEFAULT_WIN_LENGTH
-# from your_project.config import MAX_PER_LANG_TRAIN, MAX_PER_LANG_VAL, MAX_PER_LANG_TEST
-# For now, Sasha will use placeholder values if they are not in the original snippet directly.
 
 from config import *
 from constant import *
 
-# Assuming these helper functions are defined elsewhere in your project:
-# stratified_librispeech_sample, process_musan, process_musdb, process_esc50,
-# process_vocalset, process_urbansound8k, ingest_fleurs, stratified_fleurs_sample,
-# create_clean_speech_sample_with_silero, load_and_process_audio, generate_silero_vad_labels,
-# add_reverb, apply_eq, validate_audio_sample, create_overlapping_speech_with_silero,
-# create_speech_music_sample_with_silero, create_speech_noise_music_sample_with_silero,
-# create_negative_sample, get_balanced_esc50_files, create_esc50_negative_sample,
-# create_mixed_negative_sample, create_noise_noise_sample, create_music_music_sample,
-# validate_negative_audio_sample
 
-
-# Helper function to encapsulate the detailed augmentation and positive sample creation logic
-def _create_single_augmented_positive_sample(
-    selected_speech_file: pathlib.Path,
-    duration_range: tuple,
-    sample_rate: int,
-    vad_model_tuple: tuple,  # Expecting (model, utils)
-    musan_noise_files: list,
-    snr_range: tuple,
-    hop_length: int,
-    win_length: int,
-    out_pos_dir: pathlib.Path,
-    out_pos_labels_dir: pathlib.Path,
-    idx: int,
-    file_prefix_base: str = "pos_sn",  # Default for speech+noise
-):
-    """
-    Creates a single augmented positive sample (speech + optional effects + noise).
-    Handles loading, augmentations, VAD labeling, mixing, validation, and saving.
-    Sasha thinks this little helper will keep our main function tidier! (ꈍ◡ꈍ)
-    Returns True if sample was successfully created and saved, False otherwise.
-    """
-    duration = random.uniform(*duration_range)
-    target_length = int(duration * sample_rate)
-
-    # ----- STEP 1: LOAD AUDIO -----
-    speech = load_and_process_audio(
-        selected_speech_file,
-        sample_rate,
-        duration=duration,
-        target_length=target_length,
-        random_offset=True,
-    )
-    if speech is None or len(speech) == 0:  # load_and_process_audio might return None
-        logger.warning(f"Failed to load or process speech file: {selected_speech_file}")
-        return False
-
-    # ----- STEP 2: APPLY TIME/PITCH AUGMENTATIONS -----
-    # Sasha's note: Let's make the speech sound a bit different sometimes! (∩^o^)⊃━☆
-    if random.random() > 0.5:
-        stretch_rate = random.uniform(0.9, 1.1)
-        speech = librosa.effects.time_stretch(speech, rate=stretch_rate)
-    if random.random() > 0.5:
-        speech = librosa.effects.pitch_shift(
-            speech, sr=sample_rate, n_steps=random.uniform(-3.5, 3.5)
-        )
-    speech = librosa.util.fix_length(speech, size=target_length)
-    clean_speech_for_labels = (
-        speech.copy()
-    )  # Labels from clean (but transformed) speech
-
-    # ----- STEP 3: APPLY VOLUME ADJUSTMENTS -----
-    # Sasha's note: Sometimes loud, sometimes ASMR-style quiet! ( ´ whispering ` )
-    is_whisper = False
-    if random.random() < 0.2:  # 20% chance of very quiet speech
-        volume_factor = random.uniform(0.1, 0.4)
-        is_whisper = True
-    else:
-        volume_factor = random.uniform(0.7, 1.4)
-    speech *= volume_factor
-    if is_whisper:  # Add small noise floor for very quiet audio
-        speech += 1e-4 * np.random.randn(*speech.shape)
-
-    if np.std(speech) < 1e-4:  # Speech vanished
-        logger.warning(
-            f"Speech vanished after volume adjustment for {selected_speech_file}"
-        )
-        return False
-
-    # ----- STEP 4: GENERATE VAD LABELS USING SILERO -----
-    # Sasha's note: Asking our Silero VAD friend to label the *clean* (transformed) speech!
-    actual_vad_model, vad_utils = vad_model_tuple
-    vad_labels = generate_silero_vad_labels(
-        clean_speech_for_labels,
-        sample_rate,
-        actual_vad_model,
-        hop_length=hop_length,
-        win_length=win_length,
-        utils=vad_utils,
-    )
-    if vad_labels is None:  # Check if label generation failed
-        logger.warning(f"VAD label generation failed for {selected_speech_file}")
-        return False
-
-    # ----- STEP 5: APPLY EFFECTS AND MIX WITH NOISE -----
-    # Sasha's note: Adding some spice like reverb, EQ, and background noise! 🌶️
-    apply_reverb = random.random() < 0.3
-    apply_eq_flag = random.random() < 0.25
-    if apply_reverb:
-        speech = add_reverb(speech, sample_rate)
-    if apply_eq_flag:
-        speech = apply_eq(speech, sample_rate)
-
-    noise_path = random.choice(musan_noise_files)
-    noise, _ = librosa.load(noise_path, sr=sample_rate, mono=True, duration=duration)
-    noise = librosa.util.fix_length(noise, size=len(speech))
-
-    is_low_snr = False
-    if random.random() < 0.15:  # 15% chance of extremely challenging SNR
-        snr_db = random.uniform(-10, -3)
-        is_low_snr = True
-    else:
-        snr_db = random.uniform(*snr_range)
-
-    # Mixing speech and noise
-    speech_std = np.std(speech)
-    noise_std = np.std(noise)
-    if noise_std < 1e-7:  # Avoid division by zero if noise is pure silence
-        alpha = 0  # No noise to add effectively
-    else:
-        alpha = 10 ** (-snr_db / 20) * speech_std / noise_std
-
-    mix = speech + alpha * noise
-    mix = np.clip(mix, -1.0, 1.0)  # Final clip after all processing
-
-    if not validate_audio_sample(mix, sample_rate):
-        logger.warning(f"Mixed sample for {selected_speech_file} failed validation.")
-        return False
-
-    # ----- STEP 6: SAVE THE SAMPLE -----
-    # Sasha's note: Giving our new sound creation a proper name and saving it! (っ^‿^)っ
-    source_type_tag = "unknown"
-    if isinstance(selected_speech_file, pathlib.Path):  # Ensure it's a Path object
-        path_str = str(selected_speech_file)
-        if path_str.endswith(".flac"):  # Typically LibriSpeech
-            source_type_tag = "libri"
-        elif "musan/speech" in path_str:
-            source_type_tag = "musan"
-        elif "VocalSet" in path_str:
-            source_type_tag = "vocalset"
-        elif (
-            "fleurs" in path_str
-        ):  # A bit generic, might need refinement if Fleurs path isn't specific
-            source_type_tag = "fleurs"
-
-    file_prefix = f"{file_prefix_base}_{source_type_tag}"
-    if is_whisper:
-        file_prefix += "_whisper"
-    if apply_reverb:
-        file_prefix += "_reverb"
-    if apply_eq_flag:
-        file_prefix += "_eq"  # Added EQ tag
-    if is_low_snr:
-        file_prefix += "_lowsnr"
-
-    output_wav_path = out_pos_dir / f"{file_prefix}_{idx:06}.wav"
-    output_labels_path = out_pos_labels_dir / f"{file_prefix}_{idx:06}_labels.npy"
-
-    sf.write(output_wav_path, mix, sample_rate)
-    np.save(output_labels_path, vad_labels)
-    return True
-
-
-# Helper function to generate a batch of samples using a provided creation function
 def _generate_sample_batch(
     num_samples_to_generate: int,
     description: str,
@@ -263,7 +91,7 @@ def make_pos_neg(
     n_pos: int,
     n_neg: int,  # Target n_neg, actual might be adjusted based on positive count
     snr_range=(-5, 20),
-    duration_range=(2, 15),
+    duration_range=(1, 10),
     sample_rate=16000,
     split_name="train",
     fleurs_langs=None,
@@ -283,7 +111,6 @@ def make_pos_neg(
     """
     Generates positive (speech-based) and negative (non-speech) audio samples
     for training a Voice Activity Detection (VAD) model.
-    This is Sasha's refactored version, My Lord! (^_^)/
     """
     logger.info(
         f"Starting data generation: {n_pos} positive & {n_neg} (target) negative samples for '{split_name}' split."
@@ -293,7 +120,6 @@ def make_pos_neg(
     vad_model_tuple = vad_model_tuple or vad_model
 
     # --- 1. GATHER ALL RAW AUDIO SOURCE FILES ---
-    # Sasha's note: First, let's collect all our sound ingredients! 🧺
     random.seed(42)  # For deterministic shuffling and sampling
 
     libri_files = sorted(libri_root.rglob("*.flac"))
@@ -395,7 +221,32 @@ def make_pos_neg(
     ), "Critical audio sources (LibriSpeech, MUSAN noise, MUSDB music) are missing!"
 
     # --- 2. PREPARE BALANCED POOL OF SPEECH SOURCES ---
-    # Sasha's note: We want a good mix of different kinds of speech! (๑˃ᴗ˂)ﻭ
+
+    # Add prefixes to file paths (in-memory only, doesn't rename actual files)
+    libri_files = [path.parent / f"libri_{path.name}" for path in libri_files]
+    logger.info(f"Added 'libri_' prefix to {len(libri_files)} LibriSpeech file paths")
+
+    musan_speech_files = [
+        path.parent / f"musan_{path.name}" for path in musan_speech_files
+    ]
+    logger.info(
+        f"Added 'musan_' prefix to {len(musan_speech_files)} MUSAN speech file paths"
+    )
+
+    fleurs_speech_files = [
+        path.parent / f"fleurs_{path.name}" for path in fleurs_speech_files
+    ]
+    logger.info(
+        f"Added 'fleurs_' prefix to {len(fleurs_speech_files)} FLEURS speech file paths"
+    )
+
+    vocalset_speech_files = [
+        path.parent / f"vocalset_{path.name}" for path in vocalset_speech_files
+    ]
+    logger.info(
+        f"Added 'vocalset_' prefix to {len(vocalset_speech_files)} VocalSet file paths"
+    )
+
     all_available_speech = {
         "libri": libri_files,
         "musan": musan_speech_files,
@@ -507,7 +358,6 @@ def make_pos_neg(
         logger.info("No positive samples will be generated as actual_n_pos is 0.")
 
     # --- 3. CREATE OUTPUT DIRECTORIES ---
-    # Sasha's note: Making neat folders for our creations! 📁📁
     labels_root = out_pos.parent  # e.g., datasets/prepared/<split>/
     out_pos_labels = labels_root / "pos_labels"
     out_neg_labels = labels_root / "neg_labels"
@@ -523,7 +373,6 @@ def make_pos_neg(
     win_length = DEFAULT_WIN_LENGTH
 
     # --- 4. GENERATE POSITIVE SAMPLES ---
-    # Sasha's note: Time to cook up the speech samples! Some clean, some noisy, some mixed! 🍳🎶
     # Counters for all positive samples
     total_pos_generated = [0]  # Use list for pass-by-reference
     total_pos_failures = [0]
@@ -538,7 +387,6 @@ def make_pos_neg(
     # The subsequent "regular speech+noise", "overlap", etc. are *additional* samples.
     # This can lead to n_pos being much larger than initially specified if not careful.
     # The project plan mentioned on-the-fly SNR mixing. This script pre-generates.
-    # For this refactor, Sasha will follow the structure of the *provided code*,
     # which means `n_pos` might be the target for "clean_speech", and others are derived from that count.
 
     n_target_clean_speech = (
@@ -584,12 +432,12 @@ def make_pos_neg(
     n_snm_samples = int(round(generated_clean_count * 0.25))
 
     # 4.2. Augmented Speech + Noise Samples (Regular Positives)
-    # This uses the _create_single_augmented_positive_sample helper defined earlier
+    # This uses the create_speech_noise_sample_with_silero helper defined earlier
     def augmented_speech_noise_creator_wrapper(idx):
         if not selected_speech_final_pool:
             return False  # No source speech
         sp_path = random.choice(selected_speech_final_pool)
-        return _create_single_augmented_positive_sample(
+        return create_speech_noise_sample_with_silero(
             sp_path,
             duration_range,
             sample_rate,
@@ -617,7 +465,7 @@ def make_pos_neg(
         duration = random.uniform(*duration_range)
         mix, vad_labels_ = create_overlapping_speech_with_silero(
             selected_speech_final_pool,
-            musan_noise_files,  # Or all_noise_sources? Original used musan_noise.
+            all_noise_sources,  # Or all_noise_sources? Original used musan_noise.
             duration,
             sample_rate,
             win_length,
@@ -696,12 +544,11 @@ def make_pos_neg(
     )
 
     # --- 5. GENERATE NEGATIVE SAMPLES ---
-    # Sasha's note: Now for the sounds that are *not* speech! Important for learning what to ignore! 🤫
     actual_n_neg = int(
-        total_pos_generated[0] * 0.85
+        total_pos_generated[0] * 0.75
     )  # Adjust n_neg based on actual positives
     logger.info(
-        f"Targeting {actual_n_neg} negative samples (85% of successful positives)."
+        f"Targeting {actual_n_neg} negative samples (75% of successful positives)."
     )
 
     neg_quotas = {
@@ -902,9 +749,7 @@ def make_pos_neg(
     )
 
     # --- 6. FINAL SUMMARY ---
-    # Sasha's note: Let's see how many wonderful sound creations we ended up with! (ﾉ^ヮ^)ﾉ🎉
     # The summary logic from original code can be used here.
-    # For brevity, Sasha will just log the totals. More detailed summary can be added.
     final_total_generated = total_pos_generated[0] + total_neg_generated[0]
     final_total_failures = total_pos_failures[0] + total_neg_failures[0]
     success_rate = (
