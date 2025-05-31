@@ -30,6 +30,18 @@ except ImportError:
 
     logger.info("Successfully installed performer-pytorch")
 
+# Add this after your existing TorchScriptWrapper class or around line 150
+class TorchScriptWrapper(nn.Module):
+    """
+    Wrapper class to make the model TorchScript and ONNX-compatible.
+    """
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        """Forward pass without variable arguments."""
+        return self.model(x)
 
 class MelPerformer(nn.Module):
     """

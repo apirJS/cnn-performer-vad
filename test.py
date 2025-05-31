@@ -1,264 +1,94 @@
-# SileroVAD and Singing Voice Detection Playground
-import librosa
-import matplotlib.pyplot as plt
+import torch
+import onnxruntime as ort
 import numpy as np
-from pathlib import Path
-from IPython.display import Audio, display
+import matplotlib.pyplot as plt
+from models import VADLightning
 
-from prepare_data import initialize_silero_vad, generate_silero_vad_labels, get_original_path
-from utils import label_singing_vocals_heuristically
+def test_onnx_model():
+    # Load PyTorch model
+    print("Loading PyTorch model...")
+    checkpoint = torch.load("D:/belajar/audio/vad/lightning_logs/finetuning/lightning_logs/version_1/checkpoints/18-0.0164-0.9327.ckpt" , map_location="cpu")
+    hp = checkpoint["hyper_parameters"]
+    vad_model = VADLightning.load_from_checkpoint("D:/belajar/audio/vad/lightning_logs/finetuning/lightning_logs/version_1/checkpoints/18-0.0164-0.9327.ckpt", hp=hp).eval().cpu()
+    model = vad_model.net
 
-# Initialize Silero VAD model
-model, utils = initialize_silero_vad()
-vad_model = (model, utils)
+    # Freeze projections - crucial for matching behavior
+    for name, module in model.named_modules():
+        if hasattr(module, 'feature_redraw_interval'):
+            print(f"Freezing {name}")
+            module.feature_redraw_interval = 0
 
-def analyze_audio(
-    audio_path,
-    silero_threshold=0.5,
-    singing_energy_threshold=5,
-    singing_voiced_threshold=0.2,
-    use_normalization=True,
-    use_preemphasis=True,
-    use_alt_method=True,
-    detect_quiet=True
-):
-    """Analyze audio using both Silero VAD and singing voice detection"""
+    # Load ONNX model
+    onnx_path = "D:/belajar/audio/vad/models/vad.onnx"
+    print(f"Loading ONNX model from {onnx_path}")
+    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+
+    # Get input and output names
+    input_name = sess.get_inputs()[0].name
+    print(f"ONNX input name: {input_name}")
+    output_name = sess.get_outputs()[0].name
+    print(f"ONNX output name: {output_name}")
+
+    # Test with fixed sequence length and controlled random seed
+    torch.manual_seed(42)  # For reproducible results
+    x = torch.randn(1, 1000, 80)
     
-    # Load audio
-    audio_path = Path(audio_path)
-    original_path = get_original_path(audio_path)
+    # Get PyTorch prediction
+    with torch.no_grad():
+        # Raw logits for comparison if ONNX also returns logits
+        pt_logits = model(x).cpu().numpy()
+        # Apply sigmoid for probability space (final predictions)
+        pt_probs = torch.sigmoid(torch.tensor(pt_logits)).numpy()
+
+    # Run ONNX model
+    onnx_out = sess.run(None, {input_name: x.numpy()})[0]
     
-    # Display audio waveform and allow playback
-    y, sr = librosa.load(original_path, sr=16000)
+    # Check if ONNX output is in probability space (0-1) or logit space
+    is_prob_space = np.all((onnx_out >= 0) & (onnx_out <= 1))
+    print(f"ONNX output appears to be in {'probability space (0-1)' if is_prob_space else 'logit space'}")
     
-    # Generate Silero VAD labels
-    silero_labels = generate_silero_vad_labels(
-        y, sr, model,
-        threshold=silero_threshold,
-        hop_length=160,
-        win_length=400,
-        utils=utils
-    )
+    # Compare appropriate values (logits to logits or probs to probs)
+    if is_prob_space:
+        # Compare probabilities
+        pytorch_compare = pt_probs
+        max_diff = np.abs(pt_probs - onnx_out).max()
+        print(f"PyTorch probs range: {pt_probs.min():.4f} to {pt_probs.max():.4f}")
+        print(f"ONNX probs range: {onnx_out.min():.4f} to {onnx_out.max():.4f}")
+    else:
+        # Compare logits
+        pytorch_compare = pt_logits
+        max_diff = np.abs(pt_logits - onnx_out).max()
+        print(f"PyTorch logits range: {pt_logits.min():.4f} to {pt_logits.max():.4f}")
+        print(f"ONNX logits range: {onnx_out.min():.4f} to {onnx_out.max():.4f}")
     
-    # Generate singing voice detection labels
-    singing_labels = label_singing_vocals_heuristically(
-        original_path,
-        frame_hop_length=160,
-        sample_rate=sr,
-        energy_thresh_percentile=singing_energy_threshold,
-        voiced_prob_threshold=singing_voiced_threshold,
-        apply_normalization=use_normalization,
-        apply_preemphasis=use_preemphasis,
-        use_alternative_method=use_alt_method,
-        detect_quiet_beginnings=detect_quiet
-    )
+    print(f"Max absolute difference: {max_diff:.6f}")
+    
+    # Calculate correlation to see if outputs are related even if range differs
+    correlation = np.corrcoef(pytorch_compare.flatten(), onnx_out.flatten())[0, 1]
+    print(f"Correlation between PyTorch and ONNX outputs: {correlation:.6f}")
     
     # Plot comparison
-    fig, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=True)
+    plt.figure(figsize=(10, 6))
+    plt.scatter(pytorch_compare.flatten(), onnx_out.flatten(), alpha=0.3)
+    plt.plot([pytorch_compare.min(), pytorch_compare.max()], 
+             [pytorch_compare.min(), pytorch_compare.max()], 'r--')
+    plt.xlabel("PyTorch Predictions")
+    plt.ylabel("ONNX Predictions")
+    plt.title("PyTorch vs ONNX Predictions")
+    plt.savefig("onnx_validation_fixed.png")
+    print("Comparison plot saved to onnx_validation_fixed.png")
     
-    # 1. Waveform
-    axes[0].plot(np.arange(len(y)) / sr, y)
-    axes[0].set_title("Audio Waveform")
-    axes[0].set_ylabel("Amplitude")
-    
-    # 2. Silero VAD labels
-    vad_times = librosa.frames_to_time(np.arange(len(silero_labels)), sr=sr, hop_length=160)
-    axes[1].plot(vad_times, silero_labels, 'r')
-    axes[1].set_ylim([-0.1, 1.1])
-    axes[1].set_title(f"Silero VAD Labels (threshold={silero_threshold})")
-    axes[1].set_ylabel("VAD Label")
-    
-    # 3. Singing voice detection labels
-    vad_times = librosa.frames_to_time(np.arange(len(singing_labels)), sr=sr, hop_length=160)
-    axes[2].plot(vad_times, singing_labels, 'g')
-    axes[2].set_ylim([-0.1, 1.1])
-    axes[2].set_title(f"Singing Voice Detection (energy={singing_energy_threshold}%, voiced={singing_voiced_threshold})")
-    axes[2].set_ylabel("VAD Label")
-    axes[2].set_xlabel("Time (s)")
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # Calculate statistics
-    silero_active = np.mean(silero_labels) * 100
-    singing_active = np.mean(singing_labels) * 100
-    agreement = np.mean(silero_labels == singing_labels) * 100
-    
-    print(f"Silero VAD detected activity: {silero_active:.2f}% of frames")
-    print(f"Singing voice detection: {singing_active:.2f}% of frames")
-    print(f"Agreement between methods: {agreement:.2f}%")
-    
-    # Display audio for playback
-    display(Audio(y, rate=sr))
-    
-    return y, sr, silero_labels, singing_labels
+    # If correlation is high but values differ, plot a sample of outputs to check pattern
+    if correlation > 0.9 and max_diff > 0.1:
+        plt.figure(figsize=(12, 5))
+        sample_idx = np.random.randint(0, pytorch_compare.shape[1], 100)
+        # Fix here: Adjust indexing for 2D arrays
+        plt.plot(sample_idx, pytorch_compare[0, sample_idx], 'b-', label='PyTorch')
+        plt.plot(sample_idx, onnx_out[0, sample_idx], 'r-', label='ONNX')
+        plt.legend()
+        plt.title("Sample of outputs - might need rescaling or sigmoid")
+        plt.savefig("output_samples.png")
+        print("Sample outputs saved to output_samples.png")
 
-def debug_singing_detection(audio_path):
-    """Visualize all features used in singing voice detection"""
-    audio_path = Path(audio_path)
-    original_path = get_original_path(audio_path)
-    y, sr = librosa.load(original_path, sr=16000)
-    
-    # Extract features 
-    rms_frame_len = int(sr * 25 / 1000)
-    rms_hop_len = int(sr * 10 / 1000)
-    
-    # Apply pre-emphasis for energy calculation
-    y_for_energy = librosa.effects.preemphasis(y, coef=0.97)
-    rms_energy = librosa.feature.rms(
-        y=y_for_energy, 
-        frame_length=rms_frame_len,
-        hop_length=rms_hop_len, 
-        center=True
-    )[0]
-    
-    # Calculate pitch 
-    f0, voiced_flag, voiced_prob = librosa.pyin(
-        y,
-        fmin=librosa.note_to_hz("A2"),
-        fmax=librosa.note_to_hz("C6"),
-        sr=sr,
-        frame_length=rms_frame_len,
-        hop_length=rms_hop_len,
-        center=True,
-        fill_na=0.0,
-    )
-    
-    # Generate energy threshold
-    energy_thresh_percentile = 5  # Default
-    energy_threshold = np.percentile(rms_energy, energy_thresh_percentile)
-    
-    # Generate final labels using our function
-    labels = label_singing_vocals_heuristically(
-        original_path,
-        frame_hop_length=160,
-        sample_rate=sr,
-        energy_thresh_percentile=energy_thresh_percentile,
-        voiced_prob_threshold=0.2,
-    )
-    
-    # Create plots
-    fig, axes = plt.subplots(5, 1, figsize=(16, 15), sharex=True)
-    
-    # 1. Waveform
-    time = np.arange(len(y)) / sr
-    axes[0].plot(time, y)
-    axes[0].set_title("Audio Waveform")
-    axes[0].set_ylabel("Amplitude")
-    
-    # 2. RMS Energy
-    feature_times = librosa.frames_to_time(np.arange(len(rms_energy)), sr=sr, hop_length=rms_hop_len)
-    axes[1].plot(feature_times, rms_energy)
-    axes[1].axhline(y=energy_threshold, color='r', linestyle='--', label=f'{energy_thresh_percentile}th percentile')
-    axes[1].set_title("RMS Energy")
-    axes[1].set_ylabel("Energy")
-    axes[1].legend()
-    
-    # 3. Pitch (F0)
-    valid_f0 = f0.copy()
-    valid_f0[np.isnan(valid_f0)] = 0
-    axes[2].scatter(feature_times, valid_f0, s=2, alpha=0.7)
-    axes[2].set_title("Pitch (F0)")
-    axes[2].set_ylabel("Frequency (Hz)")
-    
-    # 4. Voicing Probability
-    axes[3].plot(feature_times, voiced_prob)
-    axes[3].axhline(y=0.2, color='g', linestyle='--', label='Threshold 0.2')
-    axes[3].axhline(y=0.3, color='y', linestyle='--', label='Threshold 0.3')
-    axes[3].axhline(y=0.45, color='r', linestyle='--', label='Threshold 0.45')
-    axes[3].set_title("Voicing Probability")
-    axes[3].set_ylabel("Probability")
-    axes[3].legend()
-    
-    # 5. Final VAD Labels
-    vad_times = librosa.frames_to_time(np.arange(len(labels)), sr=sr, hop_length=160)
-    axes[4].plot(vad_times, labels, 'g')
-    axes[4].set_ylim([-0.1, 1.1])
-    axes[4].set_title("Singing Voice Detection Final Labels")
-    axes[4].set_ylabel("VAD Label")
-    axes[4].set_xlabel("Time (s)")
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # Display audio for playback
-    display(Audio(y, rate=sr))
-
-def compare_parameters(
-    audio_path,
-    energy_thresholds=[5, 10, 20],
-    voiced_thresholds=[0.2, 0.3, 0.45]
-):
-    """Compare different parameter combinations for singing voice detection"""
-    
-    audio_path = Path(audio_path)
-    original_path = get_original_path(audio_path)
-    y, sr = librosa.load(original_path, sr=16000)
-    
-    # Generate reference Silero VAD labels
-    silero_labels = generate_silero_vad_labels(
-        y, sr, model,
-        hop_length=160,
-        win_length=400,
-        utils=utils
-    )
-    
-    # Setup plot
-    n_rows = len(energy_thresholds) * len(voiced_thresholds) + 1
-    fig, axes = plt.subplots(n_rows, 1, figsize=(16, n_rows*2), sharex=True)
-    
-    # Plot waveform
-    axes[0].plot(np.arange(len(y)) / sr, y)
-    axes[0].set_title("Audio Waveform")
-    axes[0].set_ylabel("Amplitude")
-    
-    # Test all parameter combinations
-    i = 1
-    for energy in energy_thresholds:
-        for voiced in voiced_thresholds:
-            # Generate labels
-            labels = label_singing_vocals_heuristically(
-                original_path,
-                frame_hop_length=160,
-                sample_rate=sr,
-                energy_thresh_percentile=energy,
-                voiced_prob_threshold=voiced,
-                apply_normalization=True,
-                apply_preemphasis=True,
-                use_alternative_method=True,
-                detect_quiet_beginnings=True
-            )
-            
-            # Plot
-            vad_times = librosa.frames_to_time(np.arange(len(labels)), sr=sr, hop_length=160)
-            axes[i].plot(vad_times, labels, 'g')
-            axes[i].set_ylim([-0.1, 1.1])
-            axes[i].set_title(f"Energy={energy}%, Voiced={voiced} → {np.mean(labels)*100:.2f}% active")
-            axes[i].set_ylabel("VAD Label")
-            i += 1
-    
-    axes[-1].set_xlabel("Time (s)")
-    plt.tight_layout()
-    plt.show()
-    
-    # Display audio for playback
-    display(Audio(y, rate=sr))
-
-# Example usage - testing a very quiet singing file:
-audio_path = "D:/belajar/audio/vad/datasets/FULL/male2/long_tones/straight/m2_long_straight_e.wav"
-
-# Basic comparison of methods
-analyze_audio(audio_path, 
-              silero_threshold=0.5,
-              singing_energy_threshold=5, 
-              singing_voiced_threshold=0.2)
-
-# Detailed debugging visualization
-debug_singing_detection(audio_path)
-
-# Compare multiple parameter combinations
-compare_parameters(
-    audio_path,
-    energy_thresholds=[3, 5, 10], 
-    voiced_thresholds=[0.15, 0.2, 0.3]
-)
+if __name__ == "__main__":
+    test_onnx_model()

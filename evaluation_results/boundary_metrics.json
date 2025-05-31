@@ -1,0 +1,51 @@
+{
+    "total_true_segments": 12081,
+    "total_pred_segments": 10417,
+    "matched_true_segments": 7329,
+    "matched_pred_segments": 7329,
+    "segment_recall": 0.6066550782220015,
+    "segment_precision": 0.703561486032447,
+    "segment_f1": 0.6515245799626633,
+    "mean_onset_error": -17.25883476599809,
+    "mean_abs_onset_error": 29.75903943239187,
+    "max_onset_error": 888.0,
+    "mean_offset_error": 19.464046936826307,
+    "mean_abs_offset_error": 31.586846773093193,
+    "max_offset_error": 1243.0,
+    "duration_stats": {
+        "true_segments": {
+            "count": 12081,
+            "mean_duration": 2.7477708798940483,
+            "median_duration": 2.08,
+            "min_duration": 0.01,
+            "max_duration": 19.51
+        },
+        "pred_segments": {
+            "count": 10417,
+            "mean_duration": 3.339929922242488,
+            "median_duration": 2.15,
+            "min_duration": 0.11,
+            "max_duration": 37.76
+        }
+    },
+    "latency": {
+        "total_segments": 12081,
+        "detected_segments": 11483,
+        "undetected_segments": 598,
+        "detection_rate": 0.9505007863587451,
+        "filtered_outliers": 1887,
+        "mean_latency_ms": -238.451438099208,
+        "median_latency_ms": -10.0,
+        "min_latency_ms": -2990.0,
+        "max_latency_ms": 2660.0
+    },
+    "segmentation_error": {
+        "under_segmentation": true,
+        "segment_ratio": 0.8622630576938995,
+        "missed_segments": 4752,
+        "extra_segments": 3088
+    },
+    "weighted_metrics": {
+        "weighted_segment_recall": 0.6135561646014468
+    }
+}

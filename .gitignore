@@ -6,14 +6,9 @@ cache
 datasets
 __pycache__
 audio
-evaluation-result
-evaluation_result
 hf_cache
 CLI.txt
 lightning_logs
-**/*.png
-**/*.csv
 **/*.rar
 mel_cache
-models
 plan.md

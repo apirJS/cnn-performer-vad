@@ -8,15 +8,15 @@ python cli.py train --accumulate_grad_batches 2 --ckpt_path "D:\belajar\audio\va
 
 python cli.py evaluate --model_path "D:\belajar\audio\vad\lightning_logs\lightning_logs\version_8\checkpoints\14-0.0152-0.9280.ckpt" --test_manifest "D:\belajar\audio\vad\datasets\manifest_test.csv" --output_dir "D:\belajar\audio\vad\evaluation_results" --pytorch_model "D:\belajar\audio\vad\models\model.pt" --quantized_model "D:\belajar\audio\vad\models\model_quantized.pt" --compare_models --boundary_analysis --two_stage_eval
 
-python cli.py evaluate --model_path "D:\belajar\audio\vad\lightning_logs\lightning_logs\version_8\checkpoints\14-0.0152-0.9280.ckpt" --test_manifest "D:\belajar\audio\vad\datasets\manifest_test.csv" --output_dir "D:\belajar\audio\vad\evaluation_results" --pytorch_model "D:\belajar\audio\vad\models\model.pt" --compare_models --boundary_analysis --two_stage_eval --smoothing_window_ms 50 --min_segment_duration_ms 150 --max_gap_duration_ms 150
+python cli.py evaluate --model_path "D:\belajar\audio\vad\lightning_logs\finetuning\lightning_logs\version_1\checkpoints\18-0.0164-0.9327.ckpt" --test_manifest "D:\belajar\audio\vad\datasets\manifest_test.csv" --output_dir "D:\belajar\audio\vad\evaluation_results" --pytorch_model "D:\belajar\audio\vad\models\vad.pt" --boundary_analysis --two_stage_eval --smoothing_window_ms 50 --min_segment_duration_ms 150 --max_gap_duration_ms 150 --quantized_model "D:\belajar\audio\vad\models\vad_quantized.pt" --compare_models
 
-python train.py --ckpt_path "D:\belajar\audio\vad\lightning_logs\lightning_logs\version_8\checkpoints\14-0.0152-0.9280.ckpt" --train_manifest "datasets/manifest_train.csv" --val_manifest "datasets/manifest_val.csv" --test_manifest "datasets/manifest_test.csv" --export_model --max_epochs 14 --export_path "D:\belajar\audio\vad\models\model.pt"
+python train.py --ckpt_path "D:\belajar\audio\vad\lightning_logs\finetuning\lightning_logs\version_1\checkpoints\18-0.0164-0.9327.ckpt" --train_manifest "datasets/manifest_train.csv" --val_manifest "datasets/manifest_val.csv" --test_manifest "datasets/manifest_test.csv" --export_model --max_epochs 19 --export_path "D:\belajar\audio\vad\models\vad.pt"
 
 Basic Dynamic Quantization
 python quantization.py --model_path models/vad_model.pt --method dynamic
 
 Dynamic Quantization with Conv2D Layers
-python quantization.py --model_path "D:\belajar\audio\vad\models\model.pt" --method dynamic --quantize_conv
+python quantization.py --model_path "D:\belajar\audio\vad\models\vad.pt" --method dynamic --quantize_conv
 
 Static Quantization with Calibration
 python quantization.py --model_path models/vad_model.pt --method static --calibration_dataset datasets/manifest_val.csv
@@ -60,3 +60,16 @@ This implementation approach gives you a systematic way to test and implement ea
 IF TRAIN FROM SCRATCH, CONSIDER THIS:
 And add these parameters when running training:
 python cli.py train --boundary_focused_loss --lr 5e-4 --max_epochs 25 --batch_size 32 --accumulate_grad_batches 2 --time_mask_max 60 --freq_mask_max 15
+
+ONNX
+python export_vad_onnx.py --ckpt "D:\belajar\audio\vad\models\vad.pt" --output "D:/belajar/audio/vad/models/vad.onnx" --n-mels 80 --dummy-frames 1000 --use-dynamo
+python test.py 
+
+
+
+python export_vad_onnx.py --ckpt path/to/quantized_model.ckpt --output vad_quant.onnx --quantized
+
+
+EVAL
+--boundary_analysis --smoothing_window_ms 30 --min_segment_duration_ms 130 --max_gap_duration_ms 70
+python cli.py evaluate --model_path "D:\belajar\audio\vad\lightning_logs\finetuning\lightning_logs\version_1\checkpoints\18-0.0164-0.9327.ckpt" --test_manifest "D:\belajar\audio\vad\datasets\manifest_test.csv" --output_dir "D:\belajar\audio\vad\evaluation_results" --pytorch_model "D:\belajar\audio\vad\models\vad.pt" --boundary_analysis --two_stage_eval --smoothing_window_ms 30 --min_segment_duration_ms 130 --max_gap_duration_ms 70 --quantized_model "D:\belajar\audio\vad\models\vad_quantized.pt" --compare_models

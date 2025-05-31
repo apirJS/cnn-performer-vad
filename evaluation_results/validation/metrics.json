@@ -1,0 +1,17 @@
+{
+    "frame_level": {
+        "roc_auc": 0.9872901609457546,
+        "pr_auc": 0.9822904056181417,
+        "optimal_threshold": 0.41156771779060364,
+        "f1_score": 0.9323149795885456,
+        "false_alarm_rate": 0.06593030733686375,
+        "miss_detection_rate": 0.04979741609968657,
+        "precision_at_recall90": 0.9477832362496601
+    },
+    "clip_level": {
+        "roc_auc": 0.9890242114651853,
+        "pr_auc": 0.9908691018008458,
+        "optimal_threshold": 0.2199374884366989,
+        "f1_score": 0.953966502858289
+    }
+}
