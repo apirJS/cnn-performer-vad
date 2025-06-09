@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # ───────────────────────────────────────────────────────────────────────
-#  boundary_finetune.py - Fine-tune VAD model with boundary-focused loss
+#  boundary_finetune.py - Enhanced fine-tuning for VAD model
 # ───────────────────────────────────────────────────────────────────────
 
 import os
@@ -8,8 +8,9 @@ import sys
 from train import main as train_main
 from argparse import Namespace
 
+
 def run_boundary_finetuning():
-    """Fine-tune VAD model with boundary-focused loss."""
+    """Fine-tune VAD model with enhanced boundary detection."""
     
     # Setup args for fine-tuning
     args = Namespace(
@@ -19,11 +20,11 @@ def run_boundary_finetuning():
         val_manifest="datasets/manifest_val.csv",
         test_manifest="datasets/manifest_test.csv",
         mel_cache_dir="mel_cache",
-        ckpt_path="D:\\belajar\\audio\\vad\\lightning_logs\\lightning_logs\\version_8\\checkpoints\\14-0.0152-0.9280.ckpt",
-        log_dir="lightning_logs/finetuning",
-        export_path="D:\\belajar\\audio\\vad\\models\\model_boundary_tuned.pt",
+        ckpt_path="D:\\belajar\\audio\\vad\\lightning_logs\\finetuning\\lightning_logs\\version_1\\checkpoints\\18-0.0164-0.9327.ckpt",
+        log_dir="lightning_logs/boundary_enhanced_finetuning",
+        export_path="D:\\belajar\\audio\\vad\\models\\vad_boundary_enhanced.pt",
         
-        # Model parameters (use same as original)
+        # Model parameters
         n_mels=80,
         n_fft=512,
         hop=160,
@@ -33,20 +34,25 @@ def run_boundary_finetuning():
         n_heads=4,
         max_frames=1000,
         
-        # Training params
-        lr=0.00005,  # Use lower learning rate for fine-tuning
-        max_epochs=20,
+        # Enhanced training params
+        lr=0.0001,  # Higher learning rate (2x original)
+        max_epochs=20,  # Train longer
         batch_size=16,
         gradient_clip_val=1.0,
-        warmup_epochs=0,  # No warmup needed for fine-tuning
-        pos_weight=1.0,  # BoundaryFocalLoss handles this
+        warmup_epochs=0,
+        pos_weight=1.0,
         seed=42,
         gpus=1,
-        accumulate_grad_batches=2,
+        accumulate_grad_batches=1,  # Reduced from 2 to have more update steps
         
-        # Augmentation
+        # Enhanced augmentation
         time_mask_max=50,
-        freq_mask_max=10,
+        freq_mask_max=20,  # Increased from 10
+        
+        # New boundary-specific parameters
+        boundary_weight=5.0,  # Increased from 3.0
+        boundary_window=3,    # Consider 3 frames on each side of boundary
+        boundary_focus_prob=0.7,  # Probability of boundary-focused augmentation
         
         # Options
         use_mel_cache=True,
@@ -55,12 +61,13 @@ def run_boundary_finetuning():
         export_model=True,
         export_quantized=True,
         auto_batch_size=False,
-        boundary_focused_loss=True,  # Enable boundary-focused loss
+        boundary_focused_loss=True,
         export_onnx=False,
+        use_enhanced_dataset=True,  # Use the new BoundaryEnhancedDataset
     )
     
     # Run the training with boundary-focused settings
-    print("Starting boundary-focused fine-tuning...")
+    print("Starting enhanced boundary-focused fine-tuning...")
     train_main(args)
     print("Fine-tuning complete!")
 

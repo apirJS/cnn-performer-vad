@@ -8,11 +8,16 @@ frame_preds = np.load('evaluation_results/frame_predictions.npy')
 frame_labels = np.load('evaluation_results/frame_labels.npy')
 
 # Parameters to tune
-smoothing_windows = [5, 7, 10, 15]
-min_segment_durations = [80, 100, 130, 160]
-max_gaps = [30, 50, 70, 90]
-high_thresholds = [0.5, 0.55, 0.6, 0.65]
-low_thresholds = [0.3, 0.35, 0.4, 0.45]
+# smoothing_windows = [5, 7, 10, 15]
+# min_segment_durations = [80, 100, 130, 160]
+# max_gaps = [30, 50, 70, 90]
+# high_thresholds = [0.5, 0.55, 0.6, 0.65]
+# low_thresholds = [0.3, 0.35, 0.4, 0.45]
+smoothing_windows = [15]
+min_segment_durations = [100]
+max_gaps = [70]
+high_thresholds = [0.5, 0.55,]
+low_thresholds = [0.4, 0.45]
 
 # Parsing arguments for analyze_speech_boundaries
 class Args:

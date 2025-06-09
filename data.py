@@ -305,6 +305,155 @@ def collate_pad(batch, max_frames=DEFAULT_MAX_FRAMES):
     return out_x, out_y, mask
 
 
+class BoundaryEnhancedDataset(CSVMelDataset):
+    """Dataset with boundary-focused augmentation."""
+    
+    def __init__(self, *args, boundary_focus_prob=0.7, max_boundary_shift=2, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.boundary_focus_prob = boundary_focus_prob
+        self.max_boundary_shift = max_boundary_shift
+        logger.info(f"Initialized BoundaryEnhancedDataset with boundary_focus_prob={boundary_focus_prob}")
+        
+    def __getitem__(self, idx):
+        path, clip_label, label_path = self.items[idx]
+        
+        # Process audio normally first
+        mel, frame_labels = super()._process_audio_file(
+            pathlib.Path(path), clip_label, pathlib.Path(label_path) if label_path else None
+        )
+        
+        # Apply boundary-focused augmentation with high probability during training
+        if "train" in str(self.manifest) and random.random() < self.boundary_focus_prob:
+            mel, frame_labels = self.boundary_augment(mel, frame_labels)
+            
+        return mel, frame_labels
+        
+    def boundary_augment(self, mel, frame_labels):
+        """Apply augmentation focused on speech boundaries."""
+        # Find transitions in labels (speech boundaries)
+        boundaries = []
+        for i in range(1, len(frame_labels)):
+            if frame_labels[i] != frame_labels[i-1]:
+                boundaries.append(i)
+                
+        if not boundaries:  # No boundaries found
+            return mel, frame_labels
+            
+        # Apply several types of boundary-focused augmentations
+        augment_type = random.randint(0, 3)
+        
+        if augment_type == 0:
+            # 1. Boundary shifting: Slightly move boundaries to create variations
+            mel, frame_labels = self.shift_boundaries(mel, frame_labels, boundaries)
+        elif augment_type == 1:
+            # 2. Boundary emphasis: Emphasize mel features at boundaries
+            mel = self.emphasize_boundaries(mel, boundaries)
+        elif augment_type == 2:
+            # 3. Boundary noise: Add noise specifically around boundaries
+            mel = self.add_boundary_noise(mel, boundaries)
+        else:
+            # 4. Create synthetic fast transitions by splicing segments
+            if len(boundaries) >= 2 and random.random() < 0.3:
+                mel, frame_labels = self.create_synthetic_transition(mel, frame_labels, boundaries)
+                
+        return mel, frame_labels
+        
+    def shift_boundaries(self, mel, labels, boundaries):
+        """Slightly shift speech boundaries to create robust detection."""
+        shifted_labels = labels.clone()
+        
+        for boundary in boundaries:
+            # Skip boundaries too close to edges
+            if boundary < self.max_boundary_shift or boundary >= len(labels) - self.max_boundary_shift:
+                continue
+                
+            # Randomly shift by -2 to +2 frames
+            shift = random.randint(-self.max_boundary_shift, self.max_boundary_shift)
+            if shift == 0:
+                continue
+                
+            new_boundary = boundary + shift
+            # Update labels to reflect shifted boundary
+            if labels[boundary-1] == 1:  # Speech to non-speech transition
+                shifted_labels[boundary:new_boundary] = 0 if shift > 0 else 1
+            else:  # Non-speech to speech transition
+                shifted_labels[boundary:new_boundary] = 1 if shift > 0 else 0
+                
+        return mel, shifted_labels
+        
+    def emphasize_boundaries(self, mel, boundaries):
+        """Emphasize mel features at boundaries to make them more distinct."""
+        enhanced_mel = mel.clone()
+        
+        for boundary in boundaries:
+            if boundary < 1 or boundary >= len(mel) - 1:
+                continue
+                
+            # Enhance the contrast at boundaries (3 frames around boundary)
+            start_idx = max(0, boundary - 1)
+            end_idx = min(len(mel), boundary + 2)
+            
+            # Increase feature values slightly at boundaries
+            boost_factor = random.uniform(1.05, 1.15)
+            enhanced_mel[start_idx:end_idx, :] *= boost_factor
+            
+        return enhanced_mel
+        
+    def add_boundary_noise(self, mel, boundaries):
+        """Add noise specifically around boundaries to improve robustness."""
+        noisy_mel = mel.clone()
+        
+        for boundary in boundaries:
+            if boundary < 2 or boundary >= len(mel) - 2:
+                continue
+                
+            # Add noise in a small window around the boundary
+            window_size = random.randint(2, 4)
+            start_idx = max(0, boundary - window_size // 2)
+            end_idx = min(len(mel), boundary + window_size // 2 + 1)
+            
+            # Add mild noise
+            noise_level = random.uniform(0.05, 0.15)
+            noise = torch.randn(end_idx - start_idx, mel.shape[1]) * noise_level
+            noisy_mel[start_idx:end_idx, :] += noise
+            
+        return noisy_mel
+        
+    def create_synthetic_transition(self, mel, labels, boundaries):
+        """Create synthetic fast transitions by splicing segments together."""
+        if len(boundaries) < 2:
+            return mel, labels
+            
+        # Choose two boundaries
+        b1_idx = random.randint(0, len(boundaries)-2)
+        b1 = boundaries[b1_idx]
+        b2 = boundaries[b1_idx+1]
+        
+        # Ensure they're far enough apart
+        if b2 - b1 < 10:
+            return mel, labels
+            
+        # Create a new synthetic boundary by splicing
+        splice_point = random.randint(b1 + 3, b2 - 3)
+        
+        # Create a rapid transition by duplicating frames from other boundary
+        transition_length = random.randint(2, 4)
+        
+        # Copy frames from around b1 to splice_point
+        for i in range(transition_length):
+            if splice_point + i < len(mel) and b1 - transition_length + i >= 0:
+                mel[splice_point + i] = mel[b1 - transition_length + i]
+                
+        # Update labels - create a more abrupt transition
+        new_labels = labels.clone()
+        # Assuming b1 transitions from 1→0 and b2 from 0→1
+        if labels[b1 - 1] == 1:  # If b1 is speech→non-speech
+            new_labels[splice_point:splice_point+transition_length] = 0  # Make it non-speech
+        else:
+            new_labels[splice_point:splice_point+transition_length] = 1  # Make it speech
+            
+        return mel, new_labels
+
 class VADDataModule(pl.LightningDataModule):
     """PyTorch Lightning DataModule for VAD task."""
 

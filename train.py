@@ -21,9 +21,10 @@ import os
 
 # Import from our modules
 from config import *
-from models import VADLightning
-from data import CSVMelDataset, VADDataModule, collate_pad
+from data import CSVMelDataset, VADDataModule, collate_pad, BoundaryEnhancedDataset
 from prepare_data import seed_everything
+
+from models import VADLightning
 
 # Configure logging
 logging.basicConfig(
@@ -241,9 +242,12 @@ def create_datasets(args):
     logger.info("Creating datasets")
     cache_dir = pathlib.Path(args.mel_cache_dir) if args.use_mel_cache else None
 
+    # Select dataset class based on args
+    dataset_class = BoundaryEnhancedDataset if getattr(args, 'use_enhanced_dataset', False) else CSVMelDataset
+    
     # Create training dataset
-    logger.info(f"Creating training dataset from {args.train_manifest}")
-    train_dataset = CSVMelDataset(
+    logger.info(f"Creating training dataset from {args.train_manifest} using {dataset_class.__name__}")
+    train_dataset = dataset_class(
         args.train_manifest,
         args.n_mels,
         args.n_fft,
@@ -252,9 +256,10 @@ def create_datasets(args):
         cache_dir=cache_dir,
         time_mask_max=args.time_mask_max,
         freq_mask_max=args.freq_mask_max,
+        **({"boundary_focus_prob": args.boundary_focus_prob} if dataset_class == BoundaryEnhancedDataset else {})
     )
 
-    # Create validation dataset
+    # Create validation dataset - always use standard dataset for validation
     logger.info(f"Creating validation dataset from {args.val_manifest}")
     val_dataset = CSVMelDataset(
         args.val_manifest,
@@ -337,7 +342,7 @@ def create_callbacks():
 
     # Checkpoint callback
     cb_ckpt = ModelCheckpoint(
-        monitor="val_loss",
+        monitor="val_loss",  # Focus on boundary performance
         mode="min",
         save_top_k=3,
         filename="{epoch:02d}-{val_loss:.4f}-{val_f1:.4f}",
@@ -596,6 +601,10 @@ def main(cli_args=None):
 
     # Create datasets and data module
     train_dataset, val_dataset = create_datasets(args)
+    
+    # Log dataset types - this helps debugging
+    logger.info(f"Train dataset type: {type(train_dataset).__name__}")
+    logger.info(f"Val dataset type: {type(val_dataset).__name__}")
 
     # Create model
     logger.info("Creating VAD model")
@@ -643,7 +652,18 @@ def main(cli_args=None):
 
     # Train the model
     logger.info("Starting training")
-    trainer.fit(model, dm, ckpt_path=args.ckpt_path)
+
+    if args.ckpt_path:
+        print(f"Loading checkpoint with partial initialization: {args.ckpt_path}")
+        checkpoint = torch.load(args.ckpt_path, map_location="cpu")
+        # Initialize model with non-strict loading
+        model.load_state_dict(checkpoint['state_dict'], strict=False)
+        # Then fit without checkpoint path
+        trainer.fit(model, dm)
+    else:
+        # Regular training from scratch
+        trainer.fit(model, dm)
+
     logger.info("Training completed")
 
     # Run test evaluation if requested

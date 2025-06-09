@@ -1802,6 +1802,36 @@ def merge_nearby_segments(segments, max_gap=3):
     return merged
 
 
+# Add after other utility functions, before the main function
+
+def adjust_predictions_for_latency(frame_preds, latency_ms=238):
+    """
+    Adjust predictions to compensate for systematic latency issues.
+    For negative latency (early detection), shift predictions forward.
+    For positive latency (late detection), shift predictions backward.
+    
+    Args:
+        frame_preds: Raw frame predictions array
+        latency_ms: Measured latency in milliseconds (negative means detecting too early)
+        
+    Returns:
+        Adjusted frame predictions
+    """
+    # Convert ms to frames (depends on hop length and sample rate)
+    frames_to_shift = int(abs(latency_ms) / (DEFAULT_HOP_LENGTH / DEFAULT_SAMPLE_RATE * 1000))
+    
+    # Create output array same size as input
+    adjusted_preds = np.zeros_like(frame_preds)
+    
+    if latency_ms < 0:  # Negative latency = detecting too early
+        # Shift predictions later (to the right)
+        adjusted_preds[frames_to_shift:] = frame_preds[:-frames_to_shift]
+    else:  # Positive latency = detecting too late
+        # Shift predictions earlier (to the left)
+        adjusted_preds[:-frames_to_shift] = frame_preds[frames_to_shift:]
+    
+    return adjusted_preds
+
 def main():
     logger.info("Starting VAD evaluation script")
 

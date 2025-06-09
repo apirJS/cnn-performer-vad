@@ -30,11 +30,13 @@ except ImportError:
 
     logger.info("Successfully installed performer-pytorch")
 
+
 # Add this after your existing TorchScriptWrapper class or around line 150
 class TorchScriptWrapper(nn.Module):
     """
     Wrapper class to make the model TorchScript and ONNX-compatible.
     """
+
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -42,6 +44,7 @@ class TorchScriptWrapper(nn.Module):
     def forward(self, x):
         """Forward pass without variable arguments."""
         return self.model(x)
+
 
 class MelPerformer(nn.Module):
     """
@@ -51,8 +54,8 @@ class MelPerformer(nn.Module):
 
     def __init__(
         self,
-        n_mels=64,
-        dim=256,
+        n_mels=80,
+        dim=192,
         layers=4,
         heads=4,
         dim_head=None,
@@ -84,6 +87,26 @@ class MelPerformer(nn.Module):
                 x = self.depthwise(x)
                 x = self.pointwise(x)
                 return x
+
+        self.boundary_head = nn.Sequential(
+            nn.Linear(dim, dim // 2),
+            nn.LayerNorm(dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim // 2, 1),
+        )
+
+        # Add a GRU layer for better temporal modeling of transitions
+        self.gru = nn.GRU(
+            input_size=dim,
+            hidden_size=dim,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+
+        # Create fusion layer for combining transformer and GRU outputs
+        self.fusion = nn.Linear(dim * 3, dim)  # 3 = dim + 2*dim/2 (bidirectional GRU)
 
         # Replace Conv1d with depthwise separable Conv2d for time-frequency pattern extraction
         self.conv_layers = nn.Sequential(
@@ -156,40 +179,38 @@ class MelPerformer(nn.Module):
 
         # Apply 2D convolution layers
         x = self.conv_layers(x)  # [B,dim,n_mels,T]
-
+        
         # Average over mel dimension and transpose back
         x = x.mean(dim=2)  # [B,dim,T]
         x = x.permute(0, 2, 1).contiguous()  # [B,T,dim]
-
+        
         x = self.proj(x)  # (B,T,dim)
         x = self.norm(x)
-
+        
         # Add positional encoding
         seq_len = min(x.shape[1], self.max_seq_len)
         x = x[:, :seq_len] + self.pos_embedding[:, :seq_len]
-
-        x = self.transformer(x)  # (B,T,dim)
-        # Apply classifier to each time step
-        return self.clf(x).squeeze(-1)  # (B,T) - one prediction per frame
-
-
-class TorchScriptWrapper(nn.Module):
-    """
-    Wrapper class to make the model TorchScript-compatible by
-    removing variable arguments from forward methods.
-    """
-
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, x):
-        """Forward pass without variable arguments."""
-        return self.model(x)
-
-
-# Then update the export_model function to use this wrapper:
-# No need to modify this file if using from train.py
+        
+        # Store transformer outputs
+        transformer_out = self.transformer(x)  # (B,T,dim)
+        
+        # Run GRU for better temporal modeling of transitions
+        gru_out, _ = self.gru(transformer_out)  # [B,T,2*dim]
+        
+        # Fuse outputs for better boundary detection
+        fused = torch.cat([transformer_out, gru_out], dim=-1)  # [B,T,3*dim]
+        fused = self.fusion(fused)  # [B,T,dim]
+        
+        # Main VAD output
+        vad_output = self.clf(transformer_out).squeeze(-1)  # [B,T]
+        
+        # Boundary detection output
+        boundary_output = self.boundary_head(fused).squeeze(-1)  # [B,T]
+        
+        if self.training:
+            return vad_output, boundary_output
+        else:
+            return vad_output  # Return only VAD output in inference mode
 
 
 class FocalLoss(nn.Module):
@@ -253,15 +274,21 @@ class FocalLoss(nn.Module):
 
 
 class BoundaryFocalLoss(nn.Module):
-    """Focal Loss with enhanced weighting for speech boundaries."""
+    """Enhanced Focal Loss with adaptive boundary weighting."""
 
     def __init__(
-        self, alpha=0.25, gamma=2.0, boundary_weight=2.0, label_smoothing=0.05
+        self,
+        alpha=0.25,
+        gamma=2.0,
+        boundary_weight=5.0,
+        window_size=3,
+        label_smoothing=0.05,
     ):
-        super(BoundaryFocalLoss, self).__init__()
+        super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.boundary_weight = boundary_weight
+        self.window_size = window_size  # Consider more frames around boundary
         self.label_smoothing = label_smoothing
 
     def forward(self, inputs, targets, mask=None):
@@ -274,27 +301,49 @@ class BoundaryFocalLoss(nn.Module):
 
         # Find boundaries (transitions in labels)
         boundaries = torch.zeros_like(targets)
-        
+
         # Handle different tensor dimensions
         if targets.dim() == 1:
-            # Case: Flattened tensor (validation with mask)
-            # Calculate transitions in the flattened sequence
-            transitions = torch.abs(torch.cat([targets[0:1], targets[:-1]]) - targets)
+            # Improved boundary detection by looking at multiple frames
+            transitions = torch.zeros_like(targets)
+            for i in range(1, len(targets)):
+                if targets[i] != targets[i - 1]:  # Direct transition
+                    transitions[
+                        max(0, i - self.window_size) : min(
+                            len(targets), i + self.window_size + 1
+                        )
+                    ] = 1.0
             boundaries = transitions
         else:
             # Case: Batched tensor with shape [batch_size, sequence_length]
             for b in range(targets.shape[0]):
-                transitions = torch.abs(targets[b, 1:] - targets[b, :-1])
-                pad = torch.zeros(1, device=targets.device)
-                transitions = torch.cat([pad, transitions], dim=0)
+                transitions = torch.zeros_like(targets[b])
+                for i in range(1, targets.shape[1]):
+                    if targets[b, i] != targets[b, i - 1]:  # Direct transition
+                        start_idx = max(0, i - self.window_size)
+                        end_idx = min(targets.shape[1], i + self.window_size + 1)
+                        transitions[start_idx:end_idx] = 1.0
                 boundaries[b] = transitions
 
-        # Create a weight tensor - higher weight at boundaries
+        # Create a weight tensor with adaptive weighting based on confidence
+        # Higher weight at boundaries, lower weight for confident predictions
         weights = torch.ones_like(targets) + boundaries * (self.boundary_weight - 1.0)
+
+        # Calculate confidence to add additional adaptive weighting
+        with torch.no_grad():
+            probs = torch.sigmoid(inputs)
+            confidence = (
+                torch.abs(probs - 0.5) * 2
+            )  # 0 for uncertain (0.5), 1 for certain (0 or 1)
+            # Reduce weight for very confident predictions
+            adaptive_factor = 1.0 - confidence * 0.5  # Scale from 0.5 to 1.0
+            weights = (
+                weights * adaptive_factor
+            )  # Lower weight for confident predictions
 
         # Apply focal loss formula
         BCE_loss = F.binary_cross_entropy_with_logits(
-            inputs, smoothed_targets, reduction='none'
+            inputs, smoothed_targets, reduction="none"
         )
         pt = torch.exp(-BCE_loss)  # Probability of being correct
 
@@ -307,10 +356,14 @@ class BoundaryFocalLoss(nn.Module):
         # Complete focal loss formula with boundary weighting
         F_loss = alpha_weight * (1 - pt) ** self.gamma * BCE_loss * weights
 
-        # Apply mask if provided (which is different from the mask already applied in _step)
+        # Apply mask if provided
         if mask is not None:
             F_loss = F_loss * mask
-            return F_loss.sum() / mask.sum() if mask.sum() > 0 else torch.tensor(0.0, device=F_loss.device)
+            return (
+                F_loss.sum() / mask.sum()
+                if mask.sum() > 0
+                else torch.tensor(0.0, device=F_loss.device)
+            )
         else:
             return F_loss.mean()
 
@@ -344,20 +397,20 @@ class VADLightning(pl.LightningModule):
 
         # Replace BCEWithLogitsLoss with FocalLoss
         # Note: FocalLoss already handles class imbalance with alpha, so pos_weight is not needed
-        if hasattr(hp, 'boundary_focused_loss') and hp.boundary_focused_loss:
+        if hasattr(hp, "boundary_focused_loss") and hp.boundary_focused_loss:
             logger.info("Using boundary-focused loss for fine-tuning")
+            boundary_weight = getattr(hp, "boundary_weight", 3.0)
+            boundary_window = getattr(hp, "boundary_window", 3)
+            logger.info(f"Boundary weight: {boundary_weight}, window: {boundary_window}")
             self.loss = BoundaryFocalLoss(
                 alpha=0.25,
                 gamma=2.0,
-                boundary_weight=3.0,  # Higher weight on boundary frames
-                label_smoothing=0.05
+                boundary_weight=boundary_weight,
+                window_size=boundary_window,
+                label_smoothing=0.05,
             )
         else:
-            self.loss = FocalLoss(
-                alpha=0.25,
-                gamma=2.0,
-                label_smoothing=0.05
-            )
+            self.loss = FocalLoss(alpha=0.25, gamma=2.0, label_smoothing=0.05)
 
         # FIX: Biarkan F1Score menggunakan threshold default 0.5
         self.train_metrics = MetricCollection(
@@ -371,48 +424,102 @@ class VADLightning(pl.LightningModule):
     def forward(self, x):
         return self.net(x)
 
-    def _step(self, batch, tag):
-        x, y, mask = batch  # Now includes mask for valid frames
 
+    def _step(self, batch, tag):
+        """Shared step logic for train/val."""
+        x, y, mask = batch  # Includes mask for valid frames
+        
         # Check if we received a completely empty/invalid batch
         if not mask.any():
             logger.warning(f"Received batch with no valid frames in {tag} step")
-            # Return a zero loss tensor that can be backpropagated
             dummy_loss = torch.tensor(0.0, requires_grad=True, device=self.device)
             self.log(f"{tag}_loss", dummy_loss, prog_bar=True, on_epoch=True)
             return dummy_loss
-
-        logger.debug(
-            f"{tag} step with batch shapes: x={x.shape}, y={y.shape}, mask={mask.shape}"
-        )
-
-        logits = self(x)  # (B,T) - per frame logits
-
-        # Apply loss only on valid (non-padded) frames using the mask
-        valid_logits = logits[mask]
+        
+        # Forward pass - handle different return formats in training vs inference
+        outputs = self(x)
+        
+        # Process outputs based on whether we're using boundary detection
+        if isinstance(outputs, tuple) and len(outputs) == 2:
+            # Boundary detection mode - unpack outputs
+            vad_logits, boundary_logits = outputs
+            using_boundary = True
+        else:
+            # Standard mode or inference - only VAD output
+            vad_logits = outputs
+            using_boundary = False
+            boundary_logits = None  # Will not be used
+        
+        # Apply mask to get only valid frames
+        valid_vad_logits = vad_logits[mask]
         valid_targets = y[mask]
-
-        # Apply loss (FocalLoss handles label smoothing internally)
-        loss = self.loss(valid_logits, valid_targets)
-
-        # For metrics, we need to use binary thresholding on the predictions
-        preds = torch.sigmoid(valid_logits)
-
-        # For accuracy, compare with original binary targets (not smoothed)
+        
+        # Apply main VAD loss
+        vad_loss = self.loss(valid_vad_logits, valid_targets)
+        
+        # Initialize total loss with VAD loss
+        loss = vad_loss
+        
+        # Add boundary detection loss if we're using boundary detection
+        if using_boundary and boundary_logits is not None:
+            # Get valid boundary logits
+            valid_boundary_logits = boundary_logits[mask]
+            
+            # Create boundary targets (1 at transitions, 0 elsewhere)
+            valid_boundary_targets = torch.zeros_like(valid_targets)
+            
+            # Process batch elements separately
+            offset = 0
+            for b in range(x.shape[0]):
+                # Count valid frames in this batch element
+                n_valid = mask[b].sum().item()
+                if n_valid <= 1:
+                    continue
+                
+                # Get targets for this element
+                element_targets = y[b, mask[b]]
+                
+                # Find transitions
+                for i in range(1, n_valid):
+                    idx = offset + i
+                    if idx < len(valid_targets) and i-1 < len(element_targets) and i < len(element_targets):
+                        if element_targets[i] != element_targets[i-1]:
+                            valid_boundary_targets[idx] = 1.0
+                
+                offset += n_valid
+            
+            # Apply boundary detection loss with higher weight for positive class
+            boundary_loss = F.binary_cross_entropy_with_logits(
+                valid_boundary_logits,
+                valid_boundary_targets,
+                pos_weight=torch.tensor([5.0], device=self.device)
+            )
+            
+            # Add weighted boundary loss
+            boundary_weight = 0.5
+            loss = vad_loss + boundary_weight * boundary_loss
+            
+            # Log additional metrics
+            self.log(f"{tag}_boundary_loss", boundary_loss, prog_bar=True, on_epoch=True)
+        
+        # For metrics calculation and logging
+        preds = torch.sigmoid(valid_vad_logits)
         binary_targets = (valid_targets > 0.5).float()
+        
+        # Calculate accuracy
         acc = ((preds > 0.5) == binary_targets.bool()).float().mean()
-
+        
         # Log metrics
         self.log(f"{tag}_loss", loss, prog_bar=True, on_epoch=True)
+        self.log(f"{tag}_vad_loss", vad_loss, prog_bar=True, on_epoch=True)
         self.log(f"{tag}_acc", acc, prog_bar=True, on_epoch=True)
-
-        # Use stateful metrics with binary targets for consistent evaluation
+        
+        # Use stateful metrics with binary targets
         if tag == "train":
             self.train_metrics.update(preds, binary_targets)
         else:
             self.val_metrics.update(preds, binary_targets)
-
-        logger.debug(f"{tag} metrics: loss={loss:.4f}, acc={acc:.4f}")
+        
         return loss
 
     def training_step(self, b, _):
@@ -421,86 +528,50 @@ class VADLightning(pl.LightningModule):
 
     def validation_step(self, b, _):
         logger.debug("Executing validation step")
-        self._step(b, "val")
+        return self._step(b, "val")  # Add 'return' to capture the metrics
+
 
     def configure_optimizers(self):
-        """
-        Configure optimizer with Cosine Annealing with Warm Restarts
-        Base LR: 1e-4, Min LR: 1e-6
-        """
-        logger.info(f"Configuring optimizer with CosineAnnealingWarmRestarts scheduler")
-
-        # Buat optimizer
+        """Configure optimizer with layer-specific learning rates."""
+        # Group parameters: higher LR for boundary-specific layers
+        boundary_params = []
+        encoder_params = []
+        
+        # Collect parameters by groups
+        for name, param in self.named_parameters():
+            if 'boundary_head' in name or 'gru' in name or 'fusion' in name:
+                boundary_params.append(param)
+            else:
+                encoder_params.append(param)
+        
+        # Create parameter groups with different LRs
+        param_groups = [
+            {'params': encoder_params, 'lr': self.hparams.lr},                 # Base LR for encoder
+            {'params': boundary_params, 'lr': self.hparams.lr * 5.0}  # Higher LR for boundary parts
+        ]
+        
+        # Create optimizer
         opt = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.hparams.lr,  # Base learning rate (1e-4)
-            weight_decay=1e-2,  # L2 regularization
-            betas=(0.9, 0.999),  # Default AdamW betas
+            param_groups,
+            weight_decay=1e-2,
+            betas=(0.9, 0.999),
         )
-
-        # Hitung parameter berdasarkan jumlah epoch total
-        total_epochs = self.trainer.max_epochs
-
-        # Pilih T_0 yang sesuai berdasarkan ukuran dataset dan jumlah epoch
-        # Untuk dataset ~35k (20k pos), 5-7 epoch adalah titik awal yang baik
-        # T_0 = max(5, min(7, total_epochs // 4))
-
-        # Pilih T_mult berdasarkan total epochs yang direncanakan
-        # Untuk 32 epoch, T_mult=2 memberikan siklus: 5, 10, 20, ...
-        # T_mult = 2
-
-        # To continue from specific epoch wihtout reset
-        T_0 = 25
-        T_mult = 1
-
-        logger.info(f"CosineAnnealingWarmRestarts config: T_0={T_0}, T_mult={T_mult}")
-        logger.info(f"Learning rates: max={self.hparams.lr}, min=1e-6")
-
-        # Setup scheduler dengan warm restarts
+        
+        # Use OneCycleLR for faster convergence
         scheduler = {
-            "scheduler": torch.optim.lr_scheduler.ConstantLR(
-                optimizer=opt,
-                factor=0.1,  # Use 10% of your base learning rate
-                total_iters=0,  # Apply immediately
+            "scheduler": torch.optim.lr_scheduler.OneCycleLR(
+                opt,
+                max_lr=[self.hparams.lr, self.hparams.lr * 5.0],  # Match parameter groups
+                total_steps=self.trainer.estimated_stepping_batches,
+                pct_start=0.2,  # Warm-up for 20% of training
+                div_factor=25.0,  # Initial LR = max_lr/25
+                final_div_factor=1000.0,  # Final LR = max_lr/1000
             ),
-            "interval": "epoch",
+            "interval": "step",
+            "frequency": 1,
         }
-        # scheduler = {
-        #     "scheduler": torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        #         optimizer=opt,
-        #         T_0=T_0,  # Panjang siklus pertama (epoch)
-        #         T_mult=T_mult,  # Faktor multiplikasi untuk panjang siklus
-        #         eta_min=1e-6,  # Minimum learning rate
-        #         last_epoch=-1,
-        #     ),
-        #     "interval": "epoch",  # Update per epoch
-        #     "frequency": 1,  # Update setiap epoch
-        #     "name": "cosine_lr",  # Nama untuk logging
-        # }
-
+        
         return {"optimizer": opt, "lr_scheduler": scheduler}
-
-    # def configure_optimizers(self): FOR TRAINING FROM SCRATCH
-    #     opt = torch.optim.AdamW(
-    #         self.parameters(),
-    #         lr=5e-4,  # Slightly higher initial LR
-    #         weight_decay=1e-2,
-    #         betas=(0.9, 0.999),
-    #     )
-        
-    #     # Use CosineAnnealingWarmRestarts with special settings
-    #     scheduler = {
-    #         "scheduler": torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    #             optimizer=opt,
-    #             T_0=3,          # First restart after 3 epochs
-    #             T_mult=2,        # Double period after each restart
-    #             eta_min=1e-6,    # Minimum LR
-    #         ),
-    #         "interval": "epoch",
-    #         "name": "cosine_restart_lr",
-    #     }
-        
-    #     return {"optimizer": opt, "lr_scheduler": scheduler}
 
     def on_train_epoch_end(self):
         self.log_dict(self.train_metrics.compute(), prog_bar=True)
@@ -510,17 +581,13 @@ class VADLightning(pl.LightningModule):
         self.log_dict(self.val_metrics.compute(), prog_bar=True)
         self.val_metrics.reset()
 
-    # Replace the test_step and on_test_epoch_end methods around line 380-443:
-
     def test_step(self, batch, batch_idx):
         """Test step for final model evaluation."""
-        # Reuse the same logic as _step method
         mel, labels, mask = batch
-
+        
         # Check if we received a completely empty/invalid batch
         if not mask.any():
             logger.warning(f"Received batch with no valid frames in test step")
-            # Return a zero loss tensor that can be backpropagated
             dummy_loss = torch.tensor(0.0, requires_grad=True, device=self.device)
             return {
                 "test_loss": dummy_loss,
@@ -528,24 +595,24 @@ class VADLightning(pl.LightningModule):
                 "test_probs": torch.tensor([0.5], device=self.device),
                 "test_labels": torch.tensor([0], device=self.device),
             }
-
-        # Forward pass
-        logits = self.net(mel)  # (B,T) - per frame logits
-
+        
+        # Forward pass - this will call self.forward which handles inference mode correctly
+        logits = self(mel)  # Only returns VAD logits in eval/test mode
+        
         # Apply loss only on valid (non-padded) frames using the mask
         valid_logits = logits[mask]
         valid_targets = labels[mask]
-
+        
         # Calculate loss using the same loss function
         loss = self.loss(valid_logits, valid_targets)
-
+        
         # For metrics, we need to use binary thresholding on the predictions
         preds = torch.sigmoid(valid_logits)
-
+        
         # For accuracy, compare with original binary targets (not smoothed)
         binary_targets = (valid_targets > 0.5).float()
         acc = ((preds > 0.5) == binary_targets.bool()).float().mean()
-
+        
         # Store for epoch-end calculation
         return {
             "test_loss": loss,
